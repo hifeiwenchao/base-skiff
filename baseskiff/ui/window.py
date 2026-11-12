@@ -11,7 +11,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -114,6 +114,7 @@ class RedisSearchModeCombo(QComboBox):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.popup_open = False
+        self.view().installEventFilter(self)
 
     def showPopup(self):
         self.popup_open = True
@@ -121,10 +122,23 @@ class RedisSearchModeCombo(QComboBox):
         super().showPopup()
 
     def hidePopup(self):
+        self._finish_popup()
         super().hidePopup()
+
+    def eventFilter(self, watched, event):
+        if watched is self.view() and event.type() == QEvent.Type.Hide:
+            # Native Escape / outside clicks can bypass Python hidePopup.
+            self._finish_popup()
+        return super().eventFilter(watched, event)
+
+    def _finish_popup(self):
+        if not self.popup_open:
+            return
         self.popup_open = False
         # The activated index still refers to the displayed model. Replacing
         # that model must wait until the selection signal has been delivered.
+        # Qt also calls hidePopup when a closed combo is hidden/reparented.
+        # Reporting those calls would make tree rebuilding schedule itself.
         QTimer.singleShot(0, self.popup_closed.emit)
 
     def wheelEvent(self, event):
