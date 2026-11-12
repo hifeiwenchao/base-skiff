@@ -38,24 +38,31 @@ def main():
             def verify():
                 if window.data_table.rowCount() and not window.busy:
                     try:
-                        assert window.current_table == 'customers'
-                        assert window.total_rows == 128
+                        if window.current_table != 'customers':
+                            raise RuntimeError(f'Expected customers workspace, got {window.current_table!r}')
+                        if window.total_rows != 128:
+                            raise RuntimeError(f'Expected workspace row count 128, got {window.total_rows!r}')
                         result = service.execute(window.current_connection.id, 'SELECT COUNT(*) AS total FROM customers')
-                        assert result.rows[0]['total'] == 128
+                        if not result.rows or result.rows[0].get('total') != 128:
+                            raise RuntimeError(f'SQLite customers count must be 128, got {result.rows!r}')
                         # External drivers, SSH crypto and durable local credentials
                         # must work inside frozen builds.
                         if args.smoke_test:
                             for name in ('pymysql', 'psycopg', 'pymongo', 'redis', 'oracledb', 'paramiko'):
                                 importlib.import_module(name)
-                            assert importlib.import_module('psycopg').pq.version() > 0
+                            if importlib.import_module('psycopg').pq.version() <= 0:
+                                raise RuntimeError('PostgreSQL libpq returned an invalid version')
                             ssh = importlib.import_module('baseskiff.ssh')
                             key = importlib.import_module('paramiko').RSAKey.generate(2048)
-                            assert ssh.fingerprint(key).startswith('SHA256:')
+                            if not ssh.fingerprint(key).startswith('SHA256:'):
+                                raise RuntimeError('SSH key fingerprint must use SHA256')
                             codec = importlib.import_module('baseskiff.redis_codec')
                             packed = importlib.import_module('msgpack').packb(
                                 {'name': 'BaseSkiff', 'binary': b'\xff\x00'}, use_bin_type=True)
-                            assert codec.preview_value(packed).format == 'msgpack'
-                            assert codec.raw_bytes(packed) == packed
+                            if codec.preview_value(packed).format != 'msgpack':
+                                raise RuntimeError('Redis MessagePack preview did not detect the binary payload')
+                            if codec.raw_bytes(packed) != packed:
+                                raise RuntimeError('Redis raw bytes did not preserve the binary payload')
                             from baseskiff.models import Connection
                             credential_dir = Path(temporary.name) / 'credential-check'
                             credential_service = DatabaseService(credential_dir)
@@ -76,7 +83,8 @@ def main():
                                 credential_service.delete_connection(candidate.id)
                         if args.screenshot:
                             args.screenshot.parent.mkdir(parents=True, exist_ok=True)
-                            assert window.grab().save(str(args.screenshot))
+                            if not window.grab().save(str(args.screenshot)):
+                                raise RuntimeError(f'Could not save screenshot to {args.screenshot}')
                         print('BaseSkiff: native workspace and SQLite checks passed' + ('; packaged drivers, Redis codecs and local credentials verified.' if args.smoke_test else '.'), flush=True)
                         status['code'] = 0
                     except Exception as exc:

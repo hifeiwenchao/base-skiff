@@ -1,11 +1,19 @@
 """Building a new release must leave previously launched bundles readable."""
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 from scripts import build
+
+
+@pytest.fixture(autouse=True)
+def isolate_ci_summary(monkeypatch):
+    # CI also runs pytest with its real summary path. Tests must never append
+    # synthetic failures to the workflow's summary.
+    monkeypatch.delenv('GITHUB_STEP_SUMMARY', raising=False)
 
 
 @pytest.mark.parametrize('platform', ['darwin', 'win32', 'linux'])
@@ -51,3 +59,124 @@ def test_repeated_builds_preserve_previous_and_legacy_bundles(tmp_path, monkeypa
     for artifact, _ in built:
         assert artifact.parent.parent == distribution
         assert str(artifact) in output
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'timeout'])
+def test_smoke_log_is_replayed_and_failure_is_preserved(tmp_path, monkeypatch, capsys, outcome):
+    diagnostic = 'Frozen startup diagnostic: 驱动加载检查\n'
+    failure = (subprocess.CalledProcessError(1, ['BaseSkiff.exe', '--smoke-test'])
+               if outcome == 'failure' else
+               subprocess.TimeoutExpired(['BaseSkiff.exe', '--smoke-test'], 60)
+               if outcome == 'timeout' else None)
+
+    def run(command, **kwargs):
+        if '--distpath' in command:
+            return
+        log_path = kwargs['env'].get('BASESKIFF_SMOKE_LOG')
+        if log_path:
+            Path(log_path).write_text(diagnostic, encoding='utf-8')
+        if failure:
+            raise failure
+
+    monkeypatch.setattr(build.subprocess, 'run', run)
+    monkeypatch.setattr(build.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(sys, 'argv', ['build.py', '--dist-dir', str(tmp_path / 'dist'),
+                                    '--work-dir', str(tmp_path / 'work'), '--smoke-test'])
+    if failure:
+        with pytest.raises(type(failure)) as caught:
+            build.main()
+        assert caught.value is failure
+    else:
+        assert build.main() == 0
+
+    output = capsys.readouterr().out
+    assert diagnostic in output
+    assert ('Bundled application smoke test passed.' in output) is (failure is None)
+
+
+def test_ci_build_failure_replays_complete_output_and_summarizes_safe_tail(tmp_path, monkeypatch, capsys):
+    summary_path = tmp_path / 'summary.md'
+    diagnostic = ('outside retained tail\n' + '\n'.join(f'build line {index}' for index in range(105))
+                  + '\n<script>markup</script>\n```\n')
+    real_run = subprocess.run
+
+    def run(command, **kwargs):
+        # Replace only the expensive builder, retaining real pipe capture and
+        # CalledProcessError output handling at the subprocess boundary.
+        return real_run([sys.executable, '-c',
+                         'import sys; sys.stdout.write(sys.argv[1]); sys.exit(7)', diagnostic], **kwargs)
+
+    monkeypatch.setenv('GITHUB_STEP_SUMMARY', str(summary_path))
+    monkeypatch.setattr(build.subprocess, 'run', run)
+    monkeypatch.setattr(build.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(sys, 'argv', ['build.py', '--dist-dir', str(tmp_path / 'dist'),
+                                    '--work-dir', str(tmp_path / 'work')])
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        build.main()
+    assert caught.value.returncode == 7
+    assert diagnostic in capsys.readouterr().out
+    assert summary_path.exists(), 'A failed CI build must publish a readable summary'
+    summary = summary_path.read_text(encoding='utf-8')
+    assert 'PyInstaller build failed' in summary
+    assert 'build line 104' in summary
+    assert 'outside retained tail' not in summary
+    assert '<script>' not in summary
+    assert '&lt;script&gt;markup&lt;/script&gt;' in summary
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'timeout'])
+def test_ci_smoke_summary_preserves_outcome_and_includes_frozen_log(tmp_path, monkeypatch, capsys, outcome):
+    summary_path = tmp_path / 'summary.md'
+    diagnostic = 'Frozen smoke details: 数据库驱动\n'
+    failure = (subprocess.CalledProcessError(1, ['BaseSkiff.exe']) if outcome == 'failure' else
+               subprocess.TimeoutExpired(['BaseSkiff.exe'], 60) if outcome == 'timeout' else None)
+
+    def run(command, **kwargs):
+        if '--distpath' in command:
+            return subprocess.CompletedProcess(command, 0, stdout='PyInstaller output\n')
+        log_path = kwargs['env'].get('BASESKIFF_SMOKE_LOG')
+        if log_path:
+            Path(log_path).write_text(diagnostic, encoding='utf-8')
+        if failure:
+            raise failure
+
+    monkeypatch.setenv('GITHUB_STEP_SUMMARY', str(summary_path))
+    monkeypatch.setattr(build.subprocess, 'run', run)
+    monkeypatch.setattr(build.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(sys, 'argv', ['build.py', '--dist-dir', str(tmp_path / 'dist'),
+                                    '--work-dir', str(tmp_path / 'work'), '--smoke-test'])
+    if failure:
+        with pytest.raises(type(failure)) as caught:
+            build.main()
+        assert caught.value is failure
+        assert summary_path.exists(), 'Frozen smoke failures must appear in the CI summary'
+        summary = summary_path.read_text(encoding='utf-8')
+        assert diagnostic.rstrip('\n') in summary
+        assert ('timed out' if outcome == 'timeout' else 'failed') in summary
+    else:
+        assert build.main() == 0
+        assert not summary_path.exists()
+    output = capsys.readouterr().out
+    assert 'PyInstaller output\n' in output
+    assert diagnostic in output
+
+
+def test_ci_failure_summary_bounds_a_single_long_line(tmp_path, monkeypatch):
+    summary_path = tmp_path / 'summary.md'
+    failure = subprocess.CalledProcessError(1, ['PyInstaller'], output='discarded-prefix' + 'x' * 20000 + 'retained-tail')
+
+    def run(command, **kwargs):
+        raise failure
+
+    monkeypatch.setenv('GITHUB_STEP_SUMMARY', str(summary_path))
+    monkeypatch.setattr(build.subprocess, 'run', run)
+    monkeypatch.setattr(build.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(sys, 'argv', ['build.py', '--dist-dir', str(tmp_path / 'dist'),
+                                    '--work-dir', str(tmp_path / 'work')])
+    with pytest.raises(subprocess.CalledProcessError):
+        build.main()
+    assert summary_path.exists(), 'A long diagnostic must still produce a bounded CI summary'
+    summary = summary_path.read_text(encoding='utf-8')
+    assert 'discarded-prefix' not in summary
+    assert 'retained-tail' in summary
+    assert len(summary.encode('utf-8')) < 17000

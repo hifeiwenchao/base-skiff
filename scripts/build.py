@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import os
 import subprocess
@@ -12,6 +13,24 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _failure_summary(path: str | None, title: str, details: str) -> None:
+    if not path:
+        return
+    tail = '\n'.join(details.splitlines()[-100:])
+    tail = tail.encode('utf-8')[-16384:].decode('utf-8', errors='ignore')
+    try:
+        with Path(path).open('a', encoding='utf-8') as summary:
+            summary.write(f'### {title}\n\n<pre>{html.escape(tail)}</pre>\n\n')
+    except OSError as error:
+        # Diagnostic publishing must not hide the original build/smoke failure.
+        print(f'Could not write CI failure summary: {error}', flush=True)
+
+
+def _echo(output: str) -> None:
+    if output:
+        print(output, end='' if output.endswith('\n') else '\n', flush=True)
 
 
 def main() -> int:
@@ -42,7 +61,21 @@ def main() -> int:
         "--distpath", str(dist_dir), "--workpath", str(work_dir),
         str(PROJECT_ROOT / "BaseSkiff.spec"),
     ]
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+    capture = ({'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT,
+                'text': True, 'encoding': 'utf-8', 'errors': 'replace'}
+               if summary_path else {})
+    try:
+        completed = subprocess.run(command, cwd=PROJECT_ROOT, check=True, **capture)
+    except (subprocess.CalledProcessError, OSError) as error:
+        output = getattr(error, 'stdout', None) or ''
+        if summary_path:
+            _echo(output)
+            _failure_summary(summary_path, 'PyInstaller build failed', f'{error}\n\n{output}')
+        raise
+    else:
+        if summary_path:
+            _echo(getattr(completed, 'stdout', None) or '')
 
     if sys.platform == "darwin":
         artifact = dist_dir / "BaseSkiff.app"
@@ -54,12 +87,31 @@ def main() -> int:
 
     if args.smoke_test:
         environment = os.environ.copy()
+        smoke_log = dist_dir / 'smoke-test.log'
+        environment['BASESKIFF_SMOKE_LOG'] = str(smoke_log)
         if sys.platform.startswith("linux") and not environment.get("DISPLAY"):
             environment.setdefault("QT_QPA_PLATFORM", "offscreen")
-        subprocess.run(
-            [str(executable), "--smoke-test"], cwd=PROJECT_ROOT,
-            env=environment, check=True, timeout=60,
-        )
+        failure = None
+        try:
+            subprocess.run(
+                [str(executable), "--smoke-test"], cwd=PROJECT_ROOT,
+                env=environment, check=True, timeout=60,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+            failure = error
+            raise
+        finally:
+            try:
+                output = smoke_log.read_text(encoding='utf-8', errors='replace')
+            except OSError as error:
+                output = f'Bundled application smoke log unavailable: {error}\n'
+            print(f'Bundled application smoke log: {smoke_log}', flush=True)
+            _echo(output)
+            if failure:
+                title = ('Bundled application smoke test timed out'
+                         if isinstance(failure, subprocess.TimeoutExpired)
+                         else 'Bundled application smoke test failed')
+                _failure_summary(summary_path, title, f'{failure}\n\n{output}')
         print("Bundled application smoke test passed.", flush=True)
     return 0
 
