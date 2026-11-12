@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabBar,
     QTableWidget,
     QTableWidgetItem,
@@ -1039,7 +1040,18 @@ class MainWindow(QMainWindow):
         host = self.tree.itemWidget(self._redis_search_item, 0)
         if host is None:
             return
-        width = max(80, self.tree.viewport().width() - 3 * self.tree.indentation())
+        index = self.tree.indexFromItem(self._redis_search_item)
+        option = QStyleOptionViewItem()
+        self.tree.initViewItemOption(option)
+        self.tree.itemDelegate().initStyleOption(option, index)
+        option.rect = self.tree.visualRect(index)
+        content = self.tree.style().subElementRect(QStyle.SubElement.SE_ItemViewItemText,
+                                                  option, self.tree)
+        # Item widgets start at the style's text inset, beyond the branch
+        # indentation. Bound them to the visible viewport even before the
+        # native delegate has delivered its final editor geometry.
+        content_left = content.left() + self.tree.horizontalOffset()
+        width = max(0, self.tree.viewport().width() - max(0, content_left))
         host.setMaximumWidth(width)
         self.redis_search_group.setMaximumWidth(width)
         height = max(self.redis_search_group.heightForWidth(width), self.redis_search_group.sizeHint().height())

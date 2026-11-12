@@ -3,8 +3,8 @@ from contextlib import contextmanager
 
 import fakeredis
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QThreadPool
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QThreadPool, qVersion
+from PySide6.QtWidgets import QApplication, QHeaderView, QStyle, QStyleOptionViewItem
 from shiboken6 import isValid
 
 from baseskiff.adapters import RedisAdapter
@@ -42,6 +42,37 @@ def run_pending(window):
         else:
             if callback:
                 callback(result)
+
+
+def search_geometry(window):
+    tree = window.tree
+    item = window._redis_search_item
+    index = tree.indexFromItem(item)
+    option = QStyleOptionViewItem()
+    tree.initViewItemOption(option)
+    tree.itemDelegate().initStyleOption(option, index)
+    option.rect = tree.visualRect(index)
+    text_rect = tree.style().subElementRect(QStyle.SubElement.SE_ItemViewItemText, option, tree)
+
+    def in_viewport(widget):
+        rectangle = widget.rect()
+        rectangle.moveTopLeft(widget.mapTo(tree.viewport(), rectangle.topLeft()))
+        return rectangle.getRect()
+
+    host = tree.itemWidget(item, 0)
+    details = {
+        'qt': qVersion(), 'style': QApplication.style().objectName(),
+        'platform': QApplication.platformName(),
+        'item_style': tree.style().metaObject().className(),
+        'dpr': window.devicePixelRatioF(), 'horizontal_offset': tree.horizontalOffset(),
+        'viewport': tree.viewport().rect().getRect(),
+        'visual': option.rect.getRect(), 'text': text_rect.getRect(),
+        'host': in_viewport(host), 'group': in_viewport(window.redis_search_group),
+        'input': in_viewport(window.redis_key_search), 'mode': in_viewport(window.redis_key_mode),
+        'host_minimum': host.minimumSize().toTuple(),
+        'group_minimum_hint': window.redis_search_group.minimumSizeHint().toTuple(),
+    }
+    return '\n'.join(f'{key}: {value}' for key, value in details.items())
 
 
 @pytest.fixture
@@ -297,9 +328,7 @@ def test_embedded_search_fits_sidebar_and_keeps_inputs_visible(window, qtbot, wi
         for control in (window.redis_key_search, window.redis_key_mode):
             rectangle = control.rect()
             rectangle.moveTopLeft(control.mapTo(viewport, rectangle.topLeft()))
-            if not viewport.rect().contains(rectangle):
-                return False
-        return True
+            assert viewport.rect().contains(rectangle), search_geometry(window)
     # Native item-widget placement and its child layout finish in separate
     # event turns on Windows. Check the settled geometry, not a single frame.
     qtbot.waitUntil(visible_controls_fit)
@@ -314,6 +343,40 @@ def test_embedded_search_fits_sidebar_and_keeps_inputs_visible(window, qtbot, wi
     assert window.redis_key_search.width() >= 60
     assert window.redis_key_mode.width() >= 65, 'Prefix/Exact must remain readable and clickable'
     assert window.redis_key_mode.height() >= 22
+
+
+@pytest.mark.parametrize('language', ['zh', 'en'])
+@pytest.mark.parametrize('horizontal_scroll', [0, 40])
+def test_embedded_search_stays_visible_when_editor_requests_full_item_width(
+        window, qtbot, language, horizontal_scroll):
+    window.language = language
+    window.translator.set_language(language)
+    window.retranslate()
+    window.shell_splitter.setSizes([200, window.width() - 206])
+    db_node(window, 0).setExpanded(True)
+    run_pending(window)
+    search_row = db_node(window, 0).child(0)
+    window.tree.scrollToItem(search_row)
+    QApplication.processEvents()
+    host = window.tree.itemWidget(search_row, 0)
+    qtbot.waitUntil(host.isVisible)
+    if horizontal_scroll:
+        window.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        window.tree.header().resizeSection(0, 600)
+        qtbot.waitUntil(lambda: window.tree.horizontalScrollBar().maximum() >= horizontal_scroll)
+        window.tree.horizontalScrollBar().setValue(horizontal_scroll)
+        window._resize_redis_search()
+        window.tree.horizontalScrollBar().setValue(0)
+        window.tree.doItemsLayout()
+    # Native editor layouts can request the full item width after positioning
+    # at the styled text inset. Our width limit must keep that request visible.
+    host.resize(window.tree.visualItemRect(search_row).width(), host.height())
+    host.layout().activate()
+    window.redis_search_group.layout().activate()
+    for control in (host, window.redis_key_search, window.redis_key_mode):
+        rectangle = control.rect()
+        rectangle.moveTopLeft(control.mapTo(window.tree.viewport(), rectangle.topLeft()))
+        assert window.tree.viewport().rect().contains(rectangle), search_geometry(window)
 
 
 def test_search_control_context_menu_cannot_target_connection(window, monkeypatch):
