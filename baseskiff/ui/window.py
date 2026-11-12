@@ -11,7 +11,18 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelection,
+    QItemSelectionModel,
+    QSettings,
+    QSignalBlocker,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -179,6 +190,13 @@ class StatusDelegate(QStyledItemDelegate):
         'inactive': ('#f0f1ee', '#92988b'), 'cancelled': ('#fbebE7', '#b47768'),
         'failed': ('#fbece8', '#b47768'),
     }
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        # Qt shapes the complete display string before eliding it. Bound that
+        # paint-only work; copying, tooltips, raw values and exports stay intact.
+        if len(option.text) > 4096:
+            option.text = option.text[:4096] + '…'
 
     def paint(self, painter, option, index):
         text = index.data() or ''
@@ -933,7 +951,8 @@ class MainWindow(QMainWindow):
                 self._request_redis_keys(replace(connection, database=database))
             elif _load_more:
                 self._request_redis_keys(replace(connection, database=database), append=True)
-            self._queue_tree_rebuild()
+            if self._redis_search_item is None or self._redis_search_item.data(0, SCOPE_ROLE) != scope:
+                self._queue_tree_rebuild()
             return
         cid = connection.id
         token = object()
@@ -1119,10 +1138,8 @@ class MainWindow(QMainWindow):
                                                          self.t('（空）', '(empty)'), self.t('个已载入的键', 'loaded keys'))
                         leaves.update({(key, str(database)): item for key, item in scoped_leaves.items()})
                         if getattr(page, 'continuation', None) is not None:
-                            loading = self._redis_key_statuses.get(scope, ('', ''))[0] == 'loading_more'
-                            more = QTreeWidgetItem([self.t('正在载入更多…', 'Loading more…') if loading else
-                                                      self.t(f'加载更多（每批最多 {MAX_REDIS_KEYS:,} 个）…',
-                                                             f'Load more (up to {MAX_REDIS_KEYS:,})…')])
+                            more = QTreeWidgetItem()
+                            self._configure_redis_load_more(more, scope)
                             more.setIcon(0, icon('refresh', '#71917a', 14))
                             more.setData(0, NODE_KIND_ROLE, 'redis_load_more')
                             more.setData(0, NODE_ID_ROLE, ('redis_load_more', *scope))
@@ -1131,8 +1148,6 @@ class MainWindow(QMainWindow):
                             more.setForeground(0, QColor('#54804e'))
                             more.setToolTip(0, self.t('保留已加载的键，再载入下一批',
                                                      'Keep loaded keys and load the next batch'))
-                            if not self._can_append_redis_keys(scope):
-                                more.setFlags(Qt.ItemFlag.NoItemFlags)
                             db.addChild(more)
                     else:
                         pending = self._redis_database_targets.get(connection.id) == str(database)
@@ -1425,6 +1440,31 @@ class MainWindow(QMainWindow):
                 and self._redis_key_page_searches.get(scope) == self._redis_search_state(scope)
                 and self._redis_key_statuses.get(scope, ('', ''))[0] not in {'loading', 'loading_more', 'waiting'})
 
+    def _configure_redis_load_more(self, item, scope):
+        loading = self._redis_key_statuses.get(scope, ('', ''))[0] == 'loading_more'
+        item.setText(0, self.t('正在载入更多…', 'Loading more…') if loading else
+                     self.t(f'加载更多（每批最多 {MAX_REDIS_KEYS:,} 个）…',
+                            f'Load more (up to {MAX_REDIS_KEYS:,})…'))
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                      if self._can_append_redis_keys(scope) else Qt.ItemFlag.NoItemFlags)
+
+    def _update_redis_load_more(self, scope):
+        # Continuation state changes only the final DB row. Keep existing keys,
+        # search widgets, selection and scroll in place while the worker runs.
+        for index in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(index)
+            if root.data(0, NODE_ID_ROLE) != ('connection', scope[0]):
+                continue
+            for index in range(root.childCount()):
+                database = root.child(index)
+                if database.data(0, SCOPE_ROLE) != scope or not database.childCount():
+                    continue
+                item = database.child(database.childCount() - 1)
+                if item.data(0, NODE_KIND_ROLE) == 'redis_load_more':
+                    self._configure_redis_load_more(item, scope)
+                    return True
+        return False
+
     def _request_redis_keys(self, connection, *, append=False):
         scope = self._redis_scope(connection)
         text, mode = self._redis_search_state(scope)
@@ -1444,7 +1484,8 @@ class MainWindow(QMainWindow):
         self._redis_search_dirty.discard(scope)
         self._redis_key_statuses[scope] = ('loading_more' if append else 'loading', '')
         self._sync_redis_search()
-        self.rebuild_tree()
+        if not append or not self._update_redis_load_more(scope):
+            self.rebuild_tree()
         def current():
             return (self._redis_search_tokens.get(scope) is token and
                     scope not in self._redis_search_dirty and
@@ -1457,7 +1498,8 @@ class MainWindow(QMainWindow):
             if current():
                 self._redis_key_statuses[scope] = ('failed', message)
                 self._sync_redis_search()
-                self.rebuild_tree()
+                if not append or not self._update_redis_load_more(scope):
+                    self.rebuild_tree()
         options = {'continuation': continuation} if append else {}
         self.submit(self._connection_operation('search_redis_keys', connection, text, mode, **options), loaded, failed)
 
@@ -1476,23 +1518,31 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _restore_grid(table, saved):
-        for index, width in enumerate(saved.get('widths', [])):
-            if index < table.columnCount():
-                table.setColumnWidth(index, width)
-        table.clearSelection()
-        row, column = saved.get('current', (-1, -1))
-        if 0 <= row < table.rowCount() and 0 <= column < table.columnCount():
-            table.setCurrentCell(row, column)
-            table.clearSelection()
-        for row in saved.get('selected', []):
-            if row < table.rowCount():
-                for column in range(table.columnCount()):
-                    item = table.item(row, column)
-                    if item:
-                        item.setSelected(True)
-        x, y = saved.get('scroll', (0, 0))
-        table.horizontalScrollBar().setValue(x)
-        table.verticalScrollBar().setValue(y)
+        # Individual cell selections fragment Qt's selection and repeatedly
+        # rescan it through itemSelectionChanged. Restore whole row ranges once.
+        with QSignalBlocker(table):
+            for index, width in enumerate(saved.get('widths', [])):
+                if index < table.columnCount():
+                    table.setColumnWidth(index, width)
+            row, column = saved.get('current', (-1, -1))
+            if 0 <= row < table.rowCount() and 0 <= column < table.columnCount():
+                table.setCurrentCell(row, column, QItemSelectionModel.SelectionFlag.NoUpdate)
+            selection = QItemSelection()
+            rows = sorted({row for row in saved.get('selected', []) if 0 <= row < table.rowCount()})
+            if rows and table.columnCount():
+                model = table.model()
+                first = last = rows[0]
+                for row in rows[1:]:
+                    if row != last + 1:
+                        selection.select(model.index(first, 0), model.index(last, table.columnCount() - 1))
+                        first = row
+                    last = row
+                selection.select(model.index(first, 0), model.index(last, table.columnCount() - 1))
+            table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                          | QItemSelectionModel.SelectionFlag.Rows)
+            x, y = saved.get('scroll', (0, 0))
+            table.horizontalScrollBar().setValue(x)
+            table.verticalScrollBar().setValue(y)
 
     def _capture_workspace(self):
         if self.redis_key_timer.isActive() and self.current_connection and self.current_connection.kind == 'Redis':
@@ -1518,7 +1568,8 @@ class MainWindow(QMainWindow):
         state.inner_tab = self.tabs.currentIndex()
         state.inspector = not self.inspector.isHidden()
         state.redis_snapshot = self._redis_snapshot
-        state.redis_draft = self.redis_view.string_editor.toPlainText() if self._redis_snapshot else None
+        state.redis_draft = (self.redis_view.string_editor.toPlainText()
+                             if self._redis_snapshot and self.redis_view._editable_string() else None)
         state.redis_search = self.redis_view.entry_search.text()
         for name, table in (('data', self.data_table), ('query', self.query_result_table),
                             ('schema', self.schema_table), ('redis', self.redis_view.table)):
@@ -1633,7 +1684,8 @@ class MainWindow(QMainWindow):
         cursor.setPosition(min(anchor, end))
         cursor.setPosition(min(position, end), cursor.MoveMode.KeepAnchor)
         self.query_editor.setTextCursor(cursor)
-        self.populate_table(self.data_table, state.current_result, (state.page - 1) * state.page_size)
+        with QSignalBlocker(self.data_table):
+            self.populate_table(self.data_table, state.current_result, (state.page - 1) * state.page_size)
         self.populate_table(self.query_result_table, state.query_result)
         self.render_schema()
         self.redis_view.set_value(state.redis_snapshot, read_only=state.connection.read_only)
@@ -1651,6 +1703,7 @@ class MainWindow(QMainWindow):
         for name, table in (('data', self.data_table), ('query', self.query_result_table),
                             ('schema', self.schema_table), ('redis', self.redis_view.table)):
             self._restore_grid(table, state.views.get(name, {}))
+        self.redis_view._update_controls()
         x, y = state.views.get('editor_scroll', (0, 0))
         self.query_editor.horizontalScrollBar().setValue(x)
         self.query_editor.verticalScrollBar().setValue(y)
@@ -1906,8 +1959,9 @@ class MainWindow(QMainWindow):
         for i, row in enumerate(result.rows):
             for j, column in enumerate(result.columns):
                 value = row.get(column)
-                item = QTableWidgetItem(display_value(value))
-                item.setToolTip(display_value(value))
+                text = display_value(value)
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
                 item.setData(Qt.ItemDataRole.UserRole, value)
                 if value is None:
                     item.setForeground(QColor('#b6beb0'))
@@ -2471,7 +2525,7 @@ class MainWindow(QMainWindow):
     def render_overview(self):
         self.stat_values[0].setText(str(len(self.connections)))
         self.stat_values[1].setText(str(len(self.tables)))
-        self.submit(self.service.list_history, lambda entries: self.stat_values[2].setText(str(len(entries))))
+        self.submit(self.service.count_history, lambda count: self.stat_values[2].setText(str(count)))
         while self.cards_layout.count():
             child = self.cards_layout.takeAt(0)
             if child.widget():
@@ -2530,7 +2584,7 @@ class MainWindow(QMainWindow):
                 return datetime.fromisoformat(value).astimezone().strftime('%Y-%m-%d %H:%M:%S')
             except ValueError:
                 return value
-        rows = [{'query': item.query.replace('\n', ' ')[:150], 'connection': item.connection_name + (f' · DB{item.database}' if getattr(item, 'database', '') else ''), 'time': local_time(item.timestamp), 'rows': item.affected, 'duration': f'{item.elapsed_ms:.1f} ms', 'status': 'success' if item.success else 'failed'} for item in entries]
+        rows = [{'query': item.query[:150].replace('\n', ' '), 'connection': item.connection_name + (f' · DB{item.database}' if getattr(item, 'database', '') else ''), 'time': local_time(item.timestamp), 'rows': item.affected, 'duration': f'{item.elapsed_ms:.1f} ms', 'status': 'success' if item.success else 'failed'} for item in entries]
         self.populate_table(self.history_table, QueryResult(columns=['query', 'connection', 'time', 'rows', 'duration', 'status'], rows=rows))
         self.history_table.setHorizontalHeaderLabels([self.t('操作语句', 'Query'), self.t('数据源', 'Connection'), self.t('执行时间', 'Time'), self.t('行数', 'Rows'), self.t('耗时', 'Duration'), self.t('状态', 'Status')])
         self.history_table.setColumnWidth(0, 370)
@@ -2543,7 +2597,7 @@ class MainWindow(QMainWindow):
     def filter_history(self, text):
         text = text.lower()
         for i, entry in enumerate(self._history):
-            self.history_table.setRowHidden(i, text not in (entry.query + entry.connection_name).lower())
+            self.history_table.setRowHidden(i, bool(text) and text not in (entry.query + entry.connection_name).lower())
 
     def select_history(self):
         indices = self.history_table.selectionModel().selectedRows()

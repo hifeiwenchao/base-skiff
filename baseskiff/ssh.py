@@ -322,20 +322,35 @@ class _Tunnel:
     def close(self):
         self.stopping.set()
         for listener in self.listeners:
-            _close_stream(listener)
+            # Closing a socket in another thread does not reliably interrupt
+            # accept on macOS. Wake it locally; stopping rejects this socket
+            # before any SSH channel can be opened.
+            try:
+                with socket.create_connection(listener.getsockname(), timeout=0.05):
+                    pass
+            except OSError:
+                _close_stream(listener)
         with self.lock:
             streams = list(self.streams)
             threads = list(self.threads)
-        for stream in streams:
+        try:
+            for stream in streams:
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except (OSError, EOFError, paramiko.SSHException):
+                    pass
+                _close_stream(stream)
+            _close_stream(self.client)
+        finally:
+            deadline = time.monotonic() + 2
             try:
-                stream.shutdown(socket.SHUT_RDWR)
-            except (OSError, EOFError, paramiko.SSHException):
-                pass
-            _close_stream(stream)
-        _close_stream(self.client)
-        deadline = time.monotonic() + 2
-        for thread in threads:
-            thread.join(timeout=max(0, deadline - time.monotonic()))
+                for thread in threads:
+                    thread.join(timeout=max(0, deadline - time.monotonic()))
+            finally:
+                # Keep the listening FD valid until accept consumes the wakeup;
+                # closing it first can leave another thread's select asleep.
+                for listener in self.listeners:
+                    _close_stream(listener)
 
 
 @contextmanager

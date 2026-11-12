@@ -1,4 +1,6 @@
 """Small, consistent vector icons, rendered locally at native pixel density."""
+from functools import lru_cache
+
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
@@ -40,6 +42,12 @@ PATHS = {
 def icon(name: str, color: str = '#7d8580', size: int = 20) -> QIcon:
     body = PATHS.get(name, PATHS['database']).replace('currentColor', color)
     svg = f'<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="{color}" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">{body}</svg>'
+    # QIcon copies share the rendered pixels until a caller changes its copy.
+    return QIcon(_render_icon(svg, size))
+
+
+@lru_cache(maxsize=128)
+def _render_icon(svg: str, size: int) -> QIcon:
     pixmap = QPixmap(size * 2, size * 2)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)

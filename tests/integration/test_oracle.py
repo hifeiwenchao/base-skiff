@@ -409,6 +409,7 @@ def test_native_qt_table_tabs_preserve_query_drafts_and_edit_the_original_table(
 def test_real_ssh_tunnel_authentication_catalog_crud_and_readonly(oracle):
     table = simple_table(oracle)
     oracle.service.insert_row(oracle.id, table, {'id': 1, 'name': 'initial'})
+    wait_for_read_only_snapshot(oracle.connection, table)
     with TestSSHServer() as ssh:
         connection = ssh.connection(oracle.connection.host, oracle.connection.port,
                                     kind='Oracle', database=oracle.connection.database,

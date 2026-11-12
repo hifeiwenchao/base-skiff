@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import unicodedata
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,13 @@ _NOTICE_ZH = {
 }
 
 
+# Unicode Cc occupies these two ranges, and Cs is the surrogate range. The
+# remaining characters are Qt's explicit text-normalization exceptions.
+_NONEDITABLE_TEXT = re.compile(
+    '[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff\u00a0\u2028\u2029\ufdd0\ufdd1\ufeff\ufffe]'
+)
+
+
 def is_editable_text(value: Any) -> bool:
     """Only expose text which QPlainTextEdit can return without normalization.
 
@@ -64,11 +71,7 @@ def is_editable_text(value: Any) -> bool:
     nonbreaking spaces, and drops byte-order markers. Embedded controls and
     lone surrogates also stay in the read-only byte view.
     """
-    return isinstance(value, str) and all(
-        character not in {'\r', '\u00a0', '\u2028', '\u2029', '\ufdd0', '\ufdd1', '\ufeff', '\ufffe'}
-        and (character in {'\t', '\n'} or unicodedata.category(character) not in {'Cc', 'Cs'})
-        for character in value
-    )
+    return isinstance(value, str) and _NONEDITABLE_TEXT.search(value) is None
 
 
 class RedisPreviewDialog(QDialog):

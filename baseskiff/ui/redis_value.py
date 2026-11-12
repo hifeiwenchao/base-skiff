@@ -342,6 +342,7 @@ class RedisValueWidget(QWidget):
                                             else preview_value(snapshot.value).text)
             self.stack.setCurrentWidget(self.string_page)
         else:
+            self.string_editor.clear()
             data = snapshot.value
             if self._kind == 'hash':
                 self._rows = list(data.items())

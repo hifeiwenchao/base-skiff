@@ -77,13 +77,16 @@ def result_from_cursor(cursor, limit=MAX_ROWS) -> QueryResult:
     if not cursor.description:
         return QueryResult(affected=max(cursor.rowcount, 0))
     columns = []
+    used, suffixes = set(), {}
     for item in cursor.description:
         name = str(item[0])
         candidate = name
-        suffix = 2
-        while candidate in columns:
+        suffix = suffixes.get(name, 2)
+        while candidate in used:
             candidate = f"{name}_{suffix}"
             suffix += 1
+        suffixes[name] = suffix
+        used.add(candidate)
         columns.append(candidate)
     values = cursor.fetchmany(limit + 1)
     rows = [dict(zip(columns, row)) for row in values[:limit]]
@@ -365,7 +368,13 @@ class SQLAdapter:
             raise ValueError("Grid editing requires a primary key. Use the query editor for this table.")
         if values is not None and not set(values) <= names:
             raise ValueError("Unknown column in row values.")
-        if keys is not None and (set(keys) != pk or any(value is None for value in keys.values())):
+        if keys is not None:
+            self._validate_row_keys(keys, pk)
+        return pk
+
+    @staticmethod
+    def _validate_row_keys(keys, primary_key):
+        if set(keys) != primary_key or any(value is None for value in keys.values()):
             raise ValueError("Provide every primary key column, and only primary key columns.")
 
     def insert_row(self, table, values):
@@ -393,9 +402,9 @@ class SQLAdapter:
             return self._query(db, f"UPDATE {self.table_sql(table)} SET {assignments} WHERE {where}", tuple(values.values()) + tuple(keys.values()))
 
     def delete_rows(self, table, keys_list):
-        self._writable_schema(table)
+        primary_key = self._writable_schema(table)
         for keys in keys_list:
-            self._writable_schema(table, keys=keys)
+            self._validate_row_keys(keys, primary_key)
         affected = 0
         with self.session() as db:
             for keys in keys_list:
@@ -930,13 +939,21 @@ class RedisAdapter:
         if self.connection.read_only and command not in self.READ_COMMANDS:
             raise PermissionError("This Redis command is not allowed on a read-only connection.")
         with self.session() as client:
-            response = _redis_decode(client.execute_command(*args))
+            response = client.execute_command(*args)
+            truncated = False
+            # Sequences retain their order when decoded, so discard invisible
+            # top-level rows before converting their possibly large payloads.
+            if isinstance(response, (list, tuple)):
+                truncated = len(response) > MAX_ROWS
+                response = response[:MAX_ROWS]
+            response = _redis_decode(response)
         if isinstance(response, dict):
             rows = [{"key": key, "value": value} for key, value in list(response.items())[:MAX_ROWS]]
             return document_result(rows, truncated=len(response) > MAX_ROWS)
         if isinstance(response, (list, tuple, set)):
             values = list(response)
-            return document_result([{"value": value} for value in values[:MAX_ROWS]], truncated=len(values) > MAX_ROWS)
+            return document_result([{"value": value} for value in values[:MAX_ROWS]],
+                                   truncated=truncated or len(values) > MAX_ROWS)
         return document_result([{"result": response}])
 
     def insert_row(self, table, values):

@@ -298,6 +298,11 @@ class DatabaseService:
             rows = db.execute("SELECT * FROM history ORDER BY rowid DESC LIMIT 1000").fetchall()
         return [HistoryEntry(**{**dict(row), "success": bool(row["success"])}) for row in rows]
 
+    def count_history(self):
+        """Count the displayed history without loading full query/error bodies."""
+        with self._metadata() as db:
+            return db.execute("SELECT COUNT(*) FROM (SELECT 1 FROM history ORDER BY rowid DESC LIMIT 1000)").fetchone()[0]
+
     def clear_history(self):
         with self._metadata() as db:
             db.execute("DELETE FROM history")

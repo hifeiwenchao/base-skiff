@@ -85,6 +85,8 @@ def safe_text(value: str | bytes) -> str:
             suffix = "; truncated" if count < len(value) else ""
             return f"<binary: {value[:count].hex(' ')}; {len(value)} bytes{suffix}>"
         value = decoded
+    if len(value) <= MAX_LABEL_CHARS - 16 and (not value or value.isprintable()):
+        return value
     text, shortened = _escape(value, layout=False, limit=MAX_LABEL_CHARS - 16)
     return text + ("… (truncated)" if shortened else "")
 
