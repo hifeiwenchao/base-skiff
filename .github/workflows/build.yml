@@ -36,7 +36,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q --junitxml=build/test-results.xml
+      - name: Summarize test results
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python scripts/report_tests.py build/test-results.xml
       - name: Build and smoke test
         run: python scripts/build.py --smoke-test
       # Archive on the runner to preserve executable bits and macOS app symlinks.

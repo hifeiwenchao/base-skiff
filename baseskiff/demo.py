@@ -1,6 +1,7 @@
 """A small, coherent fictional commerce dataset stored as ordinary SQLite."""
 import random
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def create_playground(path: Path) -> None:
     companies = ["Acme Studio", "Northstar Labs", "Lumina Design", "Orbit Systems", "Cedar & Co.",
                  "Fjord Creative", "Atlas Ventures", "Sage Collective", "Paperplane", "Bloom Works",
                  "Horizon Digital", "Riverstone", "Mosaic Studio", "Parallel Labs", "Evergreen", "Forma"]
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript('''
             PRAGMA foreign_keys = ON;
             CREATE TABLE customers (
