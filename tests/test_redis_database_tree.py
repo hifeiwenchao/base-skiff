@@ -292,6 +292,17 @@ def test_embedded_search_fits_sidebar_and_keeps_inputs_visible(window, qtbot, wi
     search_row = db_node(window, 0).child(0)
     host = window.tree.itemWidget(search_row, 0)
     assert host is not None
+    def visible_controls_fit():
+        viewport = window.tree.viewport()
+        for control in (window.redis_key_search, window.redis_key_mode):
+            rectangle = control.rect()
+            rectangle.moveTopLeft(control.mapTo(viewport, rectangle.topLeft()))
+            if not viewport.rect().contains(rectangle):
+                return False
+        return True
+    # Native item-widget placement and its child layout finish in separate
+    # event turns on Windows. Check the settled geometry, not a single frame.
+    qtbot.waitUntil(visible_controls_fit)
     assert window.redis_key_search.isVisible() and window.redis_key_mode.isVisible()
     assert host.height() >= window.redis_search_group.sizeHint().height()
     search_rect = window.redis_key_search.rect()

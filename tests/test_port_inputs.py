@@ -1,8 +1,8 @@
 """Port fields accept deliberate numeric input without wheel adjustments."""
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QAbstractSpinBox
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication
 
 from baseskiff.models import Connection
 from baseskiff.service import DatabaseService
@@ -24,9 +24,48 @@ def port_dialog(qtbot):
 def wheel(widget, delta, pixels=False):
     point = widget.rect().center()
     window = widget.window()
-    QTest.wheelEvent(window.windowHandle(), widget.mapTo(window, point),
+    handle = window.windowHandle()
+    # This window-system injection expects native pixels, unlike QWidget mouse
+    # helpers. Logical coordinates miss the field on scaled CI displays.
+    position = widget.mapTo(window, point) * handle.devicePixelRatio()
+    QTest.wheelEvent(handle, position,
                      QPoint() if pixels else QPoint(0, delta),
                      pixelDelta=QPoint(0, delta) if pixels else QPoint())
+
+
+def show_port(dialog, tab, spin):
+    # A tab switch/resize can leave a pending nested form layout even when the
+    # scrollbar already has a nonzero range. Settle it before aiming the wheel.
+    QApplication.processEvents()
+    scroll = dialog.tabs.widget(tab)
+    scroll.ensureWidgetVisible(spin)
+    QApplication.processEvents()
+    point = spin.rect().center()
+    assert scroll.viewport().rect().contains(spin.mapTo(scroll.viewport(), point))
+    target = dialog.childAt(spin.mapTo(dialog, point))
+    assert target is spin or spin.isAncestorOf(target)
+
+
+@pytest.mark.parametrize('field,tab', [('port_spin', 0), ('ssh_port_spin', 1)])
+def test_native_wheel_event_reaches_the_port_field(port_dialog, qtbot, field, tab):
+    dialog = port_dialog
+    dialog.tabs.setCurrentIndex(tab)
+    spin = getattr(dialog, field)
+    qtbot.waitUntil(spin.isVisible)
+    show_port(dialog, tab, spin)
+    received = []
+
+    class WheelObserver(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Wheel:
+                received.append(watched)
+            return False
+
+    observer = WheelObserver(spin)
+    spin.installEventFilter(observer)
+    spin.lineEdit().installEventFilter(observer)
+    wheel(spin, -120)
+    assert received, 'Window-level wheel coordinates must actually target the port or its editor'
 
 
 @pytest.mark.parametrize('field,tab', [('port_spin', 0), ('ssh_port_spin', 1)])
@@ -46,7 +85,7 @@ def test_port_wheel_never_changes_value_even_when_focused(port_dialog, qtbot,
         qtbot.waitUntil(dialog.cancel_button.hasFocus)
     original = spin.value()
     for delta in (120, -120):
-        dialog.tabs.widget(tab).ensureWidgetVisible(spin)
+        show_port(dialog, tab, spin)
         wheel(spin.lineEdit() if target == 'editor' else spin, delta, pixels)
         assert spin.value() == original
 
@@ -60,7 +99,7 @@ def test_wheel_over_port_scrolls_the_form(port_dialog, qtbot, field, tab, target
     spin = getattr(dialog, field)
     scroll = dialog.tabs.widget(tab)
     qtbot.waitUntil(lambda: scroll.verticalScrollBar().maximum() > 0)
-    scroll.ensureWidgetVisible(spin)
+    show_port(dialog, tab, spin)
     original_scroll = scroll.verticalScrollBar().value()
     assert original_scroll < scroll.verticalScrollBar().maximum()
     original_port = spin.value()
