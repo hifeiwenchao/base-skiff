@@ -1,0 +1,303 @@
+"""Persistent metadata and database operations shared by desktop workers.
+
+Every operation opens and closes its own database handle. No Qt or database
+connection object crosses a worker boundary.
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import RLock
+
+from .adapters import adapter_for, redis_database_index
+from .credentials import LocalCredentials
+from .demo import create_playground
+from .models import (
+    DATABASE_TYPES,
+    Connection,
+    HistoryEntry,
+    QueryResult,
+    RedisDatabaseList,
+    RedisKeyPage,
+    RedisValue,
+)
+from .redis_codec import json_safe
+
+SECRET_FIELDS = ('password', 'ssh_password', 'ssh_passphrase')
+
+
+def secret_key(connection_id, field):
+    return connection_id if field == 'password' else f'{connection_id}:{field}'
+
+
+def public_connection(connection):
+    return replace(connection, **dict.fromkeys(SECRET_FIELDS, ''))
+
+
+def connection_payload(connection):
+    values = asdict(connection)
+    for field in SECRET_FIELDS:
+        values.pop(field, None)
+    return values
+
+
+def history_value(value):
+    """Describe raw binary identities without changing operation arguments."""
+    return json.dumps(json_safe(value), ensure_ascii=False, default=str)
+
+
+def history_table(table):
+    return history_value(table) if isinstance(table, bytes) else table
+
+
+def default_data_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "BaseSkiff"
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "BaseSkiff"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "baseskiff"
+
+
+class DatabaseService:
+    def __init__(self, data_dir=None):
+        self.data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_path = self.data_dir / "metadata.sqlite"
+        self._lock = RLock()
+        self._credentials = LocalCredentials(self.data_dir / 'credentials.key')
+        with self._metadata() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS connections (
+                    id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS history (
+                    id TEXT PRIMARY KEY, connection_id TEXT NOT NULL, connection_name TEXT NOT NULL,
+                    query TEXT NOT NULL, timestamp TEXT NOT NULL, elapsed_ms REAL NOT NULL,
+                    affected INTEGER NOT NULL, success INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '',
+                    database TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS credentials (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+            ''')
+            db.execute("BEGIN IMMEDIATE")
+            if "database" not in {row["name"] for row in db.execute("PRAGMA table_info(history)")}:
+                db.execute("ALTER TABLE history ADD COLUMN database TEXT NOT NULL DEFAULT ''")
+            if not db.execute("SELECT 1 FROM settings WHERE key='initialized'").fetchone():
+                path = self.data_dir / "playground.sqlite"
+                create_playground(path)
+                connection = Connection(name="BaseSkiff Playground", path=str(path.resolve()),
+                                        group="Local", is_demo=True)
+                payload = connection_payload(connection)
+                db.execute("INSERT INTO connections VALUES (?, ?, ?)",
+                           (connection.id, json.dumps(payload), self._now()))
+                db.execute("INSERT INTO settings VALUES ('initialized','1')")
+        try:
+            self.metadata_path.chmod(0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _now():
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+    def _metadata(self):
+        # sqlite3's context manager commits/rolls back but does not close. This
+        # context wrapper prevents an accumulating set of worker-owned handles.
+        from contextlib import contextmanager
+
+        @contextmanager
+        def transaction():
+            with self._lock:
+                db = sqlite3.connect(self.metadata_path, timeout=10)
+                db.row_factory = sqlite3.Row
+                try:
+                    with db:
+                        yield db
+                finally:
+                    db.close()
+        return transaction()
+
+    def _password(self, connection_id):
+        with self._metadata() as db:
+            row = db.execute('SELECT value FROM credentials WHERE key=?', (connection_id,)).fetchone()
+        return self._credentials.decrypt(row['value']) if row is not None else ''
+
+    def list_connections(self):
+        with self._metadata() as db:
+            rows = db.execute("SELECT payload FROM connections ORDER BY created_at, rowid").fetchall()
+        # The password field is intentionally absent in list results. A dialog
+        # editing a connection can leave it blank to preserve its stored secret.
+        return [public_connection(Connection(**json.loads(row["payload"]))) for row in rows]
+
+    def _connection(self, connection_id):
+        with self._metadata() as db:
+            row = db.execute("SELECT payload FROM connections WHERE id=?", (connection_id,)).fetchone()
+        if row is None:
+            raise ValueError("This connection no longer exists.")
+        connection = Connection(**json.loads(row["payload"]))
+        return self._hydrate_secrets(connection)
+
+    def _hydrate_secrets(self, connection):
+        return replace(connection, **{
+            field: getattr(connection, field) or self._password(secret_key(connection.id, field))
+            for field in SECRET_FIELDS})
+
+    def save_connection(self, connection: Connection):
+        from .ssh import validate_ssh
+
+        if connection.kind not in DATABASE_TYPES:
+            raise ValueError(f"Unsupported database type: {connection.kind}")
+        if not connection.name.strip():
+            raise ValueError("Give this connection a name.")
+        if connection.kind == "SQLite" and not (connection.path or connection.database):
+            raise ValueError("Choose a SQLite database file.")
+        if connection.port and not 1 <= int(connection.port) <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
+        validate_ssh(connection)
+        connection = replace(connection, name=connection.name.strip())
+        payload = connection_payload(connection)
+        with self._metadata() as db:
+            exists = db.execute("SELECT 1 FROM connections WHERE id=?", (connection.id,)).fetchone() is not None
+            db.execute("INSERT INTO connections VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                       (connection.id, json.dumps(payload, ensure_ascii=False), self._now()))
+            # The metadata write obtains SQLite's writer lock before key-file
+            # creation. Concurrent service instances never read a partially
+            # written new key or publish different keys for the same database.
+            for field in SECRET_FIELDS:
+                value = getattr(connection, field)
+                key = secret_key(connection.id, field)
+                if value:
+                    reference = db.execute('SELECT value FROM credentials LIMIT 1').fetchone()
+                    token = self._credentials.encrypt(value, reference['value'] if reference else None)
+                    db.execute('INSERT INTO credentials VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                               (key, token))
+                elif not exists:
+                    db.execute('DELETE FROM credentials WHERE key=?', (key,))
+        return public_connection(connection)
+
+    def delete_connection(self, connection_id):
+        with self._metadata() as db:
+            db.execute("DELETE FROM connections WHERE id=?", (connection_id,))
+            for field in SECRET_FIELDS:
+                db.execute('DELETE FROM credentials WHERE key=?', (secret_key(connection_id, field),))
+
+    def test_connection(self, connection):
+        connection = self._hydrate_secrets(connection)
+        return adapter_for(connection).test()
+
+    def _operation_connection(self, connection_id, *, database=None):
+        connection = self._connection(connection_id)
+        if database is not None and connection.kind != "Redis":
+            raise ValueError("A database override requires a Redis connection.")
+        if connection.kind == "Redis":
+            index = redis_database_index((connection.database or 0) if database is None else database)
+            connection = replace(connection, database=str(index))
+        return connection
+
+    def list_tables(self, connection_id, *, database=None):
+        return adapter_for(self._operation_connection(connection_id, database=database)).list_tables()
+
+    def _redis_adapter(self, connection_id, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        if connection.kind != "Redis":
+            raise ValueError("This operation requires a Redis connection.")
+        return adapter_for(connection)
+
+    def list_redis_databases(self, connection_id) -> RedisDatabaseList:
+        return self._redis_adapter(connection_id).list_databases()
+
+    def set_redis_database(self, connection_id, index):
+        index = redis_database_index(index)
+        connection = self._operation_connection(connection_id, database=index)
+        adapter_for(connection).test()
+        with self._metadata() as db:
+            # Merge the selected database into the latest payload: a connection
+            # edit may have completed while the network test was in progress.
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM connections WHERE id=?", (connection_id,)).fetchone()
+            if row is None:
+                raise ValueError("This connection no longer exists.")
+            payload = json.loads(row["payload"])
+            if payload["kind"] != "Redis":
+                raise ValueError("This operation requires a Redis connection.")
+            payload["database"] = str(index)
+            db.execute("UPDATE connections SET payload=? WHERE id=?",
+                       (json.dumps(payload, ensure_ascii=False), connection_id))
+        return public_connection(Connection(**payload))
+
+    def search_redis_keys(self, connection_id, text="", mode="prefix", *, database=None, continuation=None) -> RedisKeyPage:
+        adapter = self._redis_adapter(connection_id, database=database)
+        if continuation is None:
+            return adapter.search_keys(text, mode)
+        return adapter.search_keys(text, mode, continuation=continuation)
+
+    def read_redis_key(self, connection_id, key, *, database=None) -> RedisValue:
+        return self._redis_adapter(connection_id, database=database).read_key(key)
+
+    def mutate_redis_entry(self, connection_id, key, kind, action, payload, *, database=None) -> QueryResult:
+        description = f"REDIS {action.upper()} {kind} {history_value(key)} {history_value(payload)}"
+
+        def mutate(adapter):
+            if adapter.connection.kind != "Redis":
+                raise ValueError("This operation requires a Redis connection.")
+            return adapter.mutate_entry(key, kind, action, payload)
+
+        return self._perform(connection_id, description, mutate, database=database)
+
+    def get_schema(self, connection_id, table, *, database=None):
+        return adapter_for(self._operation_connection(connection_id, database=database)).get_schema(table)
+
+    def fetch_rows(self, connection_id, table, page=1, page_size=50, search="", sort_column="", descending=False, *, database=None):
+        start = time.perf_counter()
+        result = adapter_for(self._operation_connection(connection_id, database=database)).fetch_rows(
+            table, page=page, page_size=page_size, search=search,
+            sort_column=sort_column, descending=descending)
+        result.elapsed_ms = (time.perf_counter() - start) * 1000
+        return result
+
+    def _perform(self, connection_id, description, operation, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        start = time.perf_counter()
+        result, error, success = QueryResult(), "", False
+        try:
+            result = operation(adapter_for(connection))
+            success = True
+            return result
+        except Exception as exception:
+            error = str(exception)
+            raise
+        finally:
+            elapsed = (time.perf_counter() - start) * 1000
+            result.elapsed_ms = elapsed
+            with self._metadata() as db:
+                db.execute("INSERT INTO history (id, connection_id, connection_name, query, timestamp, elapsed_ms, affected, success, error, database) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (uuid.uuid4().hex, connection_id, connection.name, description, self._now(),
+                            elapsed, result.affected, int(success), error,
+                            connection.database if connection.kind == "Redis" else ""))
+
+    def execute(self, connection_id, query, *, database=None):
+        return self._perform(connection_id, query, lambda adapter: adapter.execute(query), database=database)
+
+    def insert_row(self, connection_id, table, values, *, database=None):
+        description = f"INSERT {history_table(table)} {history_value(values)}"
+        return self._perform(connection_id, description, lambda adapter: adapter.insert_row(table, values), database=database)
+
+    def update_row(self, connection_id, table, keys, values, *, database=None):
+        description = f"UPDATE {history_table(table)} SET {history_value(values)} WHERE {history_value(keys)}"
+        return self._perform(connection_id, description, lambda adapter: adapter.update_row(table, keys, values), database=database)
+
+    def delete_rows(self, connection_id, table, keys_list, *, database=None):
+        description = f"DELETE {history_table(table)} WHERE {history_value(keys_list)}"
+        return self._perform(connection_id, description, lambda adapter: adapter.delete_rows(table, keys_list), database=database)
+
+    def list_history(self):
+        with self._metadata() as db:
+            rows = db.execute("SELECT * FROM history ORDER BY rowid DESC LIMIT 1000").fetchall()
+        return [HistoryEntry(**{**dict(row), "success": bool(row["success"])}) for row in rows]
+
+    def clear_history(self):
+        with self._metadata() as db:
+            db.execute("DELETE FROM history")
