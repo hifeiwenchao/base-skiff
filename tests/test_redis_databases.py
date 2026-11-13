@@ -268,5 +268,5 @@ def test_history_migrates_existing_rows_without_losing_queries(tmp_path):
     assert (entry.query, entry.database) == ("GET old-key", "")
     demo = service.list_connections()[0]
     service.execute(demo.id, "SELECT 1")
-    assert service.list_history()[0].database == ""
+    assert service.list_history()[0].database == "playground.sqlite"
     assert DatabaseService(tmp_path).list_history()[-1].query == "GET old-key"

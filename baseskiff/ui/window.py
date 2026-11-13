@@ -18,6 +18,7 @@ from PySide6.QtCore import (
     QSettings,
     QSignalBlocker,
     QSize,
+    QStringListModel,
     Qt,
     QThreadPool,
     QTimer,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QCompleter,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -250,6 +252,8 @@ class MainWindow(QMainWindow):
         self._tree_search_text = ''
         self._tree_active_key = None
         self._redis_key_searches = {}
+        self._redis_search_history = {}
+        self._redis_search_history_loaded = set()
         self._redis_applied_searches = {}
         self._redis_key_pages = {}
         self._redis_key_page_searches = {}
@@ -325,7 +329,8 @@ class MainWindow(QMainWindow):
         self.overview_nav = button('', 'grid', self.show_overview, 'navButton')
         self.workspace_nav = button('', 'database', self.show_workspace, 'navButton')
         self.history_nav = button('', 'history', self.show_history, 'navButton')
-        for nav in (self.overview_nav, self.workspace_nav, self.history_nav):
+        self.history_nav.hide()
+        for nav in (self.overview_nav, self.workspace_nav):
             side.addWidget(nav)
         side.addSpacing(23)
         connection_heading = QHBoxLayout()
@@ -351,6 +356,9 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.redis_key_search, 1)
         self.redis_key_search_button = button('', 'search', self._search_redis_keys, 'redisKeySearchSubmit')
         search_row.addWidget(self.redis_key_search_button)
+        self.redis_key_history_button = self.redis_key_search.addAction(
+            icon('history', '#588068', 15), QLineEdit.ActionPosition.TrailingPosition)
+        self.redis_key_history_button.triggered.connect(self._show_redis_search_history)
         redis_search_layout.addLayout(search_row)
         self.redis_key_mode = RedisSearchModeCombo(objectName='redisKeySearchMode')
         self.redis_key_mode.setMinimumWidth(65)
@@ -365,6 +373,13 @@ class MainWindow(QMainWindow):
         self.redis_key_search.textChanged.connect(self._redis_search_changed)
         self.redis_key_search.returnPressed.connect(self._search_redis_keys)
         self.redis_key_mode.currentIndexChanged.connect(self._redis_search_changed)
+        self.redis_key_history_model = QStringListModel(self)
+        self.redis_key_completer = QCompleter(self.redis_key_history_model, self)
+        self.redis_key_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseSensitive)
+        self.redis_key_completer.setFilterMode(Qt.MatchFlag.MatchStartsWith)
+        self.redis_key_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.redis_key_completer.activated.connect(self._select_redis_search_text)
+        self.redis_key_search.setCompleter(self.redis_key_completer)
         self.redis_search_group.hide()
         self.tree = ConnectionTree()
         self.tree.setHeaderHidden(True)
@@ -471,6 +486,8 @@ class MainWindow(QMainWindow):
         self.table_tabs.customContextMenuRequested.connect(self._table_tab_menu)
         main.addWidget(self.table_tabs)
         heading_wrap = QWidget()
+        self.table_heading_wrap = heading_wrap
+        heading_wrap.setObjectName('workspaceHeading')
         heading_layout = layout(heading_wrap, 0, 7)
         heading_layout.setContentsMargins(30, 25, 30, 16)
         title_row = QHBoxLayout()
@@ -491,6 +508,11 @@ class MainWindow(QMainWindow):
         self.table_subtitle = label('', 'tableSubtitle')
         heading_layout.addWidget(self.table_subtitle)
         main.addWidget(heading_wrap)
+        # The object title and subtitle duplicate the selected tree item and
+        # consume a full horizontal band above every table. Keep the widgets
+        # for state, accessibility and existing integrations, but collapse the
+        # presentation region so the data workspace starts higher.
+        heading_wrap.hide()
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setContentsMargins(29, 0, 29, 0)
@@ -782,6 +804,8 @@ class MainWindow(QMainWindow):
                                             'Literal prefix · Exact full key'))
         self.redis_key_search_button.setToolTip(self.t('搜索（Enter）', 'Search (Enter)'))
         self.redis_key_search_button.setAccessibleName(self.t('搜索', 'Search'))
+        self.redis_key_history_button.setText(self.t('搜索历史', 'Search history'))
+        self.redis_key_history_button.setToolTip(self.t('搜索历史', 'Search history'))
         self.tip_title.setText(self.t('为专注而设计', 'A little more flow'))
         self.tip_text.setText(self.t('⌘ / Ctrl + Enter 运行查询\n⌘ / Ctrl + K 快速查找连接', '⌘ / Ctrl + Enter to run a query\n⌘ / Ctrl + K to find a connection'))
         self.local_label.setText(self.t('本地工作空间', 'Local workspace'))
@@ -884,6 +908,12 @@ class MainWindow(QMainWindow):
         if not connection or connection.kind != 'Redis':
             return None
         return connection.id, connection.database or '0'
+
+    @staticmethod
+    def _history_database(connection):
+        if not connection:
+            return ''
+        return connection.database or (Path(connection.path).name if connection.kind == 'SQLite' else '')
 
     def _connection_operation(self, method, connection, *args, **kwargs):
         """Bind the selected DB before a worker is queued, including writes."""
@@ -1217,6 +1247,17 @@ class MainWindow(QMainWindow):
                     child.setData(0, SEARCH_ROLE, table.name)
                     root.addChild(child)
                     leaves[(table.qualified_name, connection.database or '0')] = child
+                if (connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
+                        and self._connection_tables.get(connection.id)):
+                    history = QTreeWidgetItem([self.t('操作历史', 'History')])
+                    history.setIcon(0, icon('history', '#9da994', 14))
+                    history.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
+                    history.setData(0, NODE_KIND_ROLE, 'sql_history')
+                    database = self._history_database(connection)
+                    history.setData(0, NODE_ID_ROLE, ('sql_history', connection.id, database))
+                    history.setData(0, SCOPE_ROLE, (connection.id, database))
+                    history.setData(0, SEARCH_ROLE, self.t('操作历史', 'History'))
+                    root.addChild(history)
             root_identity = root.data(0, NODE_ID_ROLE)
             self._tree_expansion.setdefault(root_identity, bool(self.current_connection and self.current_connection.id == connection.id))
             selected = leaves.get((active_key[1], active_key[2])) if active_key and active_key[0] == connection.id else None
@@ -1311,6 +1352,10 @@ class MainWindow(QMainWindow):
         connection = next((c for c in self.connections if c.id == cid), None)
         if not connection:
             return
+        if kind == 'sql_history':
+            scope = item.data(0, SCOPE_ROLE) or (connection.id, self._history_database(connection))
+            self.show_history(connection, scope[1])
+            return
         if kind == 'redis_other_database':
             database, accepted = QInputDialog.getInt(self, self.t('选择 Redis 数据库', 'Select Redis database'),
                                                     self.t('DB 编号', 'DB index'), 0, 0, 2147483647)
@@ -1392,6 +1437,117 @@ class MainWindow(QMainWindow):
             self._redis_key_searches[scope] = (text, mode)
         return text, mode
 
+    @staticmethod
+    def _redis_history_value(entry, name, default=None):
+        if isinstance(entry, dict):
+            return entry.get(name, default)
+        return getattr(entry, name, default)
+
+    def _load_redis_search_history(self, scope):
+        if scope is None or scope in self._redis_search_history_loaded:
+            return
+        connection_id, database = scope
+        try:
+            entries = list(self.service.list_redis_search_history(connection_id, database))
+        except Exception:
+            entries = []
+        self._redis_search_history[scope] = entries
+        self._redis_search_history_loaded.add(scope)
+        if self._redis_scope(self.current_connection) == scope:
+            self._refresh_redis_search_completer()
+
+    def _refresh_redis_search_completer(self):
+        scope = self._redis_scope(self.current_connection)
+        entries = self._redis_search_history.get(scope, [])
+        self.redis_key_history_model.setStringList([
+            str(self._redis_history_value(entry, 'text', '')) for entry in entries
+            if self._redis_history_value(entry, 'text', '') != ''
+        ])
+
+    def _select_redis_search_text(self, text):
+        scope = self._redis_scope(self.current_connection)
+        entry = next((item for item in self._redis_search_history.get(scope, [])
+                      if self._redis_history_value(item, 'text') == text), None)
+        if entry is not None:
+            self._select_redis_search_history(entry)
+
+    def _select_redis_search_history(self, entry):
+        connection = self.current_connection
+        scope = self._redis_scope(connection)
+        if scope is None:
+            return
+        text = str(self._redis_history_value(entry, 'text', ''))
+        mode = self._redis_history_value(entry, 'mode', 'prefix')
+        if mode not in REDIS_KEY_SEARCH_MODES:
+            mode = 'prefix'
+        self.redis_key_search.blockSignals(True)
+        self.redis_key_mode.blockSignals(True)
+        self.redis_key_search.setText(text)
+        self.redis_key_mode.setCurrentIndex(self.redis_key_mode.findData(mode))
+        self.redis_key_search.blockSignals(False)
+        self.redis_key_mode.blockSignals(False)
+        self._redis_key_searches[scope] = (text, mode)
+        self._search_redis_keys()
+
+    def _toggle_redis_search_favorite(self, entry):
+        identifier = self._redis_history_value(entry, 'id')
+        if identifier is None:
+            return
+        favorite = not bool(self._redis_history_value(entry, 'is_favorite', False))
+        try:
+            if not self.service.set_redis_search_favorite(identifier, favorite):
+                return
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        if isinstance(entry, dict):
+            entry['is_favorite'] = favorite
+        else:
+            entry.is_favorite = favorite
+        self._refresh_redis_search_completer()
+
+    def _delete_redis_search_history(self, entry):
+        identifier = self._redis_history_value(entry, 'id')
+        if identifier is None:
+            return
+        try:
+            if not self.service.delete_redis_search_history(identifier):
+                return
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        scope = self._redis_scope(self.current_connection)
+        entries = self._redis_search_history.get(scope, [])
+        self._redis_search_history[scope] = [item for item in entries
+                                             if self._redis_history_value(item, 'id') != identifier]
+        self._refresh_redis_search_completer()
+
+    def _show_redis_search_history(self):
+        scope = self._redis_scope(self.current_connection)
+        if scope is None:
+            return
+        self._load_redis_search_history(scope)
+        menu = QMenu(self)
+        entries = self._redis_search_history.get(scope, [])
+        if not entries:
+            empty = menu.addAction(self.t('暂无搜索历史', 'No search history'))
+            empty.setEnabled(False)
+        for entry in entries:
+            text = str(self._redis_history_value(entry, 'text', ''))
+            mode = self._redis_history_value(entry, 'mode', 'prefix')
+            favorite = bool(self._redis_history_value(entry, 'is_favorite', False))
+            select = menu.addAction(('★ ' if favorite else '') + text)
+            select.triggered.connect(lambda _checked=False, item=entry: self._select_redis_search_history(item))
+            tools = menu.addMenu(self.t('管理：', 'Manage: ') + text)
+            tools.addAction(self.t('取消收藏' if favorite else '收藏',
+                                   'Unfavorite' if favorite else 'Favorite'),
+                            lambda item=entry: self._toggle_redis_search_favorite(item))
+            tools.addAction(self.t('删除', 'Delete'),
+                            lambda item=entry: self._delete_redis_search_history(item))
+            select.setToolTip(self.t(f'{text} · {mode}', f'{text} · {mode}'))
+        menu.exec(self.redis_key_search.mapToGlobal(
+            self.redis_key_search.rect().bottomRight()))
+
     def _sync_redis_search(self):
         connection = self.current_connection
         if not connection or connection.kind != 'Redis':
@@ -1401,6 +1557,7 @@ class MainWindow(QMainWindow):
         if self.redis_key_mode.popup_open:
             return
         owner = self._redis_scope(connection)
+        self._load_redis_search_history(owner)
         text, mode = self._redis_search_state(owner)
         if owner != self._redis_search_owner or self.redis_key_mode.currentData() != mode:
             self._redis_search_owner = owner
@@ -1472,6 +1629,21 @@ class MainWindow(QMainWindow):
         if not self._redis_applied_searches.get(scope, ('', 'prefix'))[0] and text:
             self._capture_tree_expansion()
         self._redis_applied_searches[scope] = (text, mode)
+        if text:
+            try:
+                recorded = self.service.record_redis_search(connection.id, connection.database or '0', text, mode)
+            except Exception as error:
+                self.show_error(str(error))
+                recorded = None
+            if recorded is not None:
+                entries = self._redis_search_history.setdefault(scope, [])
+                identifier = self._redis_history_value(recorded, 'id')
+                entries[:] = [item for item in entries
+                               if self._redis_history_value(item, 'id') != identifier
+                               and self._redis_history_value(item, 'text') != text]
+                entries.insert(0, recorded)
+                self._redis_search_history_loaded.add(scope)
+                self._refresh_redis_search_completer()
         self._refresh_redis_keys()
 
     def _refresh_redis_keys(self):
@@ -2981,12 +3153,19 @@ class MainWindow(QMainWindow):
         self.cards_layout.setColumnStretch(0, 1)
         self.cards_layout.setColumnStretch(1, 1)
 
-    def show_history(self):
+    def show_history(self, connection=None, database=None):
         self._navigation = 'history'
         self.stack.setCurrentIndex(2)
-        self.breadcrumb.setText(self.t('工作空间   /   操作历史', 'Workspace   /   History'))
+        if connection is None:
+            self.breadcrumb.setText(self.t('工作空间   /   操作历史', 'Workspace   /   History'))
+        else:
+            self.breadcrumb.setText(self.t(f'{connection.name}   /   操作历史',
+                                           f'{connection.name}   /   History'))
         self.update_nav()
-        self.submit(self.service.list_history, self.render_history)
+        self._history_scope = ((connection.id, database) if connection is not None else None)
+        self.submit(partial(self.service.list_history,
+                            connection.id if connection is not None else None,
+                            database), self.render_history)
 
     def render_history(self, entries):
         self._history = entries
@@ -3040,7 +3219,11 @@ class MainWindow(QMainWindow):
     def clear_history(self):
         response = QMessageBox.question(self, self.t('清空历史', 'Clear history'), self.t('确认清空本机的全部操作历史？此操作无法撤销。', 'Clear all local operation history? This cannot be undone.'), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
         if response == QMessageBox.StandardButton.Yes:
-            self.submit(self.service.clear_history, lambda _: (self.history_detail.clear(), self.render_history([])))
+            scope = getattr(self, '_history_scope', None)
+            self.submit(partial(self.service.clear_history,
+                                scope[0] if scope else None,
+                                scope[1] if scope else None),
+                        lambda _: (self.history_detail.clear(), self.render_history([])))
 
     def show_error(self, message):
         self.footer_status.setText(self.t('操作失败', 'Operation failed'))

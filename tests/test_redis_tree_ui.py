@@ -291,8 +291,10 @@ def test_other_database_catalogs_remain_flat(tree_window, kind):
     window._connection_tables = {connection.id: [TableInfo('a:b:c'), TableInfo('other')]}
     window.rebuild_tree()
     root = window.tree.topLevelItem(0)
-    assert root.childCount() == 2
-    assert [root.child(index).text(0) for index in range(root.childCount())] == ['a:b:c', 'other']
+    assert root.childCount() == (3 if kind == 'PostgreSQL' else 2)
+    assert [root.child(index).text(0) for index in range(2)] == ['a:b:c', 'other']
+    if kind == 'PostgreSQL':
+        assert root.child(2).data(0, KIND_ROLE) == 'sql_history'
     window.filter_tree('b:c')
     assert not root.isHidden()
     assert not root.child(0).isHidden()

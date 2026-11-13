@@ -81,6 +81,18 @@ class DatabaseService:
                     database TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS credentials (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS redis_searches (
+                    id TEXT PRIMARY KEY,
+                    connection_id TEXT NOT NULL,
+                    database TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('prefix', 'exact')),
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    is_favorite INTEGER NOT NULL DEFAULT 0 CHECK(is_favorite IN (0, 1)),
+                    UNIQUE(connection_id, database, text));
+                CREATE INDEX IF NOT EXISTS idx_redis_searches_scope_time
+                    ON redis_searches(connection_id, database, last_used_at DESC);
             ''')
             db.execute("BEGIN IMMEDIATE")
             if "database" not in {row["name"] for row in db.execute("PRAGMA table_info(history)")}:
@@ -181,6 +193,7 @@ class DatabaseService:
     def delete_connection(self, connection_id):
         with self._metadata() as db:
             db.execute("DELETE FROM connections WHERE id=?", (connection_id,))
+            db.execute("DELETE FROM redis_searches WHERE connection_id=?", (connection_id,))
             for field in SECRET_FIELDS:
                 db.execute('DELETE FROM credentials WHERE key=?', (secret_key(connection_id, field),))
 
@@ -284,11 +297,12 @@ class DatabaseService:
         finally:
             elapsed = (time.perf_counter() - start) * 1000
             result.elapsed_ms = elapsed
+            history_database = connection.database or (
+                Path(connection.path).name if connection.kind == "SQLite" else "")
             with self._metadata() as db:
                 db.execute("INSERT INTO history (id, connection_id, connection_name, query, timestamp, elapsed_ms, affected, success, error, database) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (uuid.uuid4().hex, connection_id, connection.name, description, self._now(),
-                            elapsed, result.affected, int(success), error,
-                            connection.database if connection.kind == "Redis" else ""))
+                            elapsed, result.affected, int(success), error, history_database))
 
     def execute(self, connection_id, query, *, database=None):
         return self._perform(connection_id, query, lambda adapter: adapter.execute(query), database=database)
@@ -315,9 +329,17 @@ class DatabaseService:
 
         return self._perform(connection_id, description, mutate, database=database)
 
-    def list_history(self):
+    def list_history(self, connection_id=None, database=None):
+        conditions, values = [], []
+        if connection_id is not None:
+            conditions.append("connection_id=?")
+            values.append(str(connection_id))
+        if database is not None:
+            conditions.append("database=?")
+            values.append(str(database))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
         with self._metadata() as db:
-            rows = db.execute("SELECT * FROM history ORDER BY rowid DESC LIMIT 1000").fetchall()
+            rows = db.execute(f"SELECT * FROM history{where} ORDER BY rowid DESC LIMIT 1000", values).fetchall()
         return [HistoryEntry(**{**dict(row), "success": bool(row["success"])}) for row in rows]
 
     def count_history(self):
@@ -325,6 +347,95 @@ class DatabaseService:
         with self._metadata() as db:
             return db.execute("SELECT COUNT(*) FROM (SELECT 1 FROM history ORDER BY rowid DESC LIMIT 1000)").fetchone()[0]
 
-    def clear_history(self):
+    def clear_history(self, connection_id=None, database=None):
+        conditions, values = [], []
+        if connection_id is not None:
+            conditions.append("connection_id=?")
+            values.append(str(connection_id))
+        if database is not None:
+            conditions.append("database=?")
+            values.append(str(database))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
         with self._metadata() as db:
-            db.execute("DELETE FROM history")
+            db.execute(f"DELETE FROM history{where}", values)
+
+    def list_redis_search_history(self, connection_id, database):
+        """Return recent searches for one Redis connection and database."""
+        with self._metadata() as db:
+            rows = db.execute(
+                """SELECT id, connection_id, database, text, mode, created_at,
+                          last_used_at, is_favorite
+                   FROM redis_searches
+                   WHERE connection_id=? AND database=?
+                   ORDER BY is_favorite DESC, last_used_at DESC, rowid DESC""",
+                (str(connection_id), str(database)),
+            ).fetchall()
+        return [{**dict(row), "is_favorite": bool(row["is_favorite"])} for row in rows]
+
+    def record_redis_search(self, connection_id, database, text, mode):
+        """Record one explicitly submitted search without storing result keys."""
+        if mode not in {"prefix", "exact"}:
+            raise ValueError("Redis search history mode must be prefix or exact.")
+        if not isinstance(text, str):
+            raise ValueError("Redis search history text must be a string.")
+        if text == "":
+            return None
+        connection_id, database = str(connection_id), str(database)
+        now = self._now()
+        with self._metadata() as db:
+            row = db.execute(
+                "SELECT id, created_at, is_favorite FROM redis_searches "
+                "WHERE connection_id=? AND database=? AND text=?",
+                (connection_id, database, text),
+            ).fetchone()
+            if row is None:
+                identifier = uuid.uuid4().hex
+                db.execute(
+                    """INSERT INTO redis_searches
+                       (id, connection_id, database, text, mode, created_at, last_used_at, is_favorite)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                    (identifier, connection_id, database, text, mode, now, now),
+                )
+                favorite = False
+                created_at = now
+            else:
+                identifier = row["id"]
+                db.execute(
+                    "UPDATE redis_searches SET mode=?, last_used_at=? WHERE id=?",
+                    (mode, now, identifier),
+                )
+                favorite = bool(row["is_favorite"])
+                created_at = row["created_at"]
+            # Keep at most 100 non-favorite rows globally. Favorites are never
+            # selected for eviction and therefore may exceed that bound.
+            db.execute(
+                """DELETE FROM redis_searches
+                   WHERE is_favorite=0 AND id IN (
+                       SELECT id FROM redis_searches
+                       WHERE is_favorite=0
+                       ORDER BY last_used_at DESC, rowid DESC
+                       LIMIT -1 OFFSET 100)"""
+            )
+            return {
+                "id": identifier,
+                "connection_id": connection_id,
+                "database": database,
+                "text": text,
+                "mode": mode,
+                "created_at": created_at,
+                "last_used_at": now,
+                "is_favorite": favorite,
+            }
+
+    def set_redis_search_favorite(self, identifier, favorite):
+        if not isinstance(favorite, bool):
+            raise ValueError("Redis search favorite must be a boolean.")
+        with self._metadata() as db:
+            cursor = db.execute("UPDATE redis_searches SET is_favorite=? WHERE id=?",
+                                (int(favorite), str(identifier)))
+        return cursor.rowcount > 0
+
+    def delete_redis_search_history(self, identifier):
+        with self._metadata() as db:
+            cursor = db.execute("DELETE FROM redis_searches WHERE id=?", (str(identifier),))
+        return cursor.rowcount > 0
