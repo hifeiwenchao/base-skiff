@@ -39,6 +39,7 @@ def test_hash_load_displays_separate_fields_and_hides_generic_grid(window, qtbot
     assert window.redis_view.table.rowCount() == 2
     assert not window.data_splitter.isVisible()
     assert not window.data_search.isVisible()
+    assert not window.table_criteria_bar.isVisible()
     assert not window.data_pager.isVisible()
     window.current_connection = window.connections[0]
     window.update_context()

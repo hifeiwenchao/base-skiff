@@ -525,6 +525,7 @@ class MainWindow(QMainWindow):
         tab_layout = layout(tab)
         tab_layout.setContentsMargins(24, 0, 24, 0)
         criteria = QWidget(objectName='tableCriteriaBar')
+        self.table_criteria_bar = criteria
         criteria_layout = layout(criteria, 0, 8, True)
         criteria_layout.setContentsMargins(0, 12, 0, 0)
         self.where_label = label('WHERE', 'criteriaLabel')
@@ -2232,6 +2233,7 @@ class MainWindow(QMainWindow):
         self.data_views.setCurrentWidget(self.redis_view if redis else self.data_splitter)
         self.data_search.setVisible(not redis)
         sql_table = bool(connection and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and self.current_table)
+        self.table_criteria_bar.setVisible(sql_table)
         self.where_edit.setVisible(sql_table)
         self.order_by_edit.setVisible(sql_table)
         self.apply_table_query_button.setVisible(sql_table)
