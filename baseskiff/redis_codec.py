@@ -1,12 +1,14 @@
-"""Bounded, read-only display codecs for Redis values.
+"""Bounded Redis value previews and safe serialization round trips.
 
-Nothing here deserializes executable Python objects or changes a stored value.
-``raw_bytes`` is the export path; previews and labels may be shortened for the UI.
-MessagePack type markers are display metadata, not a format for writing values.
+Preview decoding never executes application code or changes a stored value.
+``raw_bytes`` is the export path, while ``encode_preview_value`` is the
+explicit opt-in path used by the editor after the user submits decoded data.
+Previews and labels may be shortened for the UI.
 """
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import math
 import struct
@@ -572,3 +574,233 @@ def preview_value(value: str | bytes, format: str = "auto") -> ValuePreview:
     if format in {"gzip", "zlib"}:
         return _hex(data, f"Unable to decode complete {format.upper()} stream.")
     return _preview_uncompressed(data, format)
+
+
+def _edited_json(text: str) -> Any:
+    """Parse an editor value with the same bounds used by the preview path."""
+    if not isinstance(text, str):
+        raise ValueError("Edited value must be text.")
+    if len(text.encode("utf-8", errors="surrogatepass")) > MAX_DECODE_BYTES:
+        raise ValueError("Edited value exceeds the 1 MiB limit.")
+    try:
+        return _json(text)
+    except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+        raise ValueError(f"Invalid JSON value: {exc}") from exc
+
+
+def _decode_edit_marker(value: Any, kind: str) -> Any:
+    """Turn preview markers back into values understood by a writer."""
+    if isinstance(value, list):
+        return [_decode_edit_marker(item, kind) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    marker = value.get(f"${kind}")
+    if kind == "msgpack" and marker == "binary":
+        encoded = value.get("base64")
+        if not isinstance(encoded, str):
+            raise ValueError("MessagePack binary marker needs a Base64 string.")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ValueError("MessagePack binary marker has invalid Base64.") from exc
+    if kind == "msgpack" and marker == "extension":
+        code, encoded = value.get("code"), value.get("base64")
+        if not isinstance(code, int) or isinstance(code, bool) or not -128 <= code <= 127:
+            raise ValueError("MessagePack extension code must be between -128 and 127.")
+        if not isinstance(encoded, str):
+            raise ValueError("MessagePack extension marker needs a Base64 string.")
+        try:
+            return msgpack.ExtType(code, base64.b64decode(encoded, validate=True))
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ValueError("MessagePack extension marker has invalid Base64.") from exc
+    if kind == "msgpack" and marker == "timestamp":
+        seconds, nanos = value.get("seconds"), value.get("nanoseconds")
+        if (isinstance(seconds, bool) or not isinstance(seconds, int) or
+                isinstance(nanos, bool) or not isinstance(nanos, int) or not 0 <= nanos < 1_000_000_000):
+            raise ValueError("MessagePack timestamp is invalid.")
+        try:
+            return msgpack.Timestamp(seconds, nanos)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("MessagePack timestamp is out of range.") from exc
+    if kind == "msgpack" and marker == "float":
+        names = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
+        if value.get("value") not in names:
+            raise ValueError("MessagePack float marker is invalid.")
+        return names[value["value"]]
+    if kind == "msgpack" and marker == "map":
+        entries = value.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("MessagePack map marker needs an entries array.")
+        return _MapPairs([
+            (_decode_edit_marker(pair[0], kind), _decode_edit_marker(pair[1], kind))
+            for pair in entries if isinstance(pair, list) and len(pair) == 2
+        ]) if all(isinstance(pair, list) and len(pair) == 2 for pair in entries) else _invalid_marker()
+    if kind == "cbor" and marker == "binary":
+        encoded = value.get("base64")
+        if not isinstance(encoded, str):
+            raise ValueError("CBOR binary marker needs a Base64 string.")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ValueError("CBOR binary marker has invalid Base64.") from exc
+    if kind == "cbor" and marker == "tag":
+        tag, nested = value.get("tag"), value.get("value")
+        if isinstance(tag, bool) or not isinstance(tag, int) or tag < 0:
+            raise ValueError("CBOR tag must be a non-negative integer.")
+        return _CBORTag(tag, _decode_edit_marker(nested, kind))
+    if kind == "cbor" and marker == "simple":
+        simple = value.get("value")
+        if isinstance(simple, bool) or not isinstance(simple, int) or not 0 <= simple <= 255:
+            raise ValueError("CBOR simple value is invalid.")
+        return _CBORSimple(simple)
+    if kind == "cbor" and marker == "undefined":
+        return _CBORSimple(23)
+    if kind == "cbor" and marker == "float":
+        names = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
+        if value.get("value") not in names:
+            raise ValueError("CBOR float marker is invalid.")
+        return names[value["value"]]
+    if kind == "cbor" and marker == "map":
+        entries = value.get("entries")
+        if not isinstance(entries, list) or not all(isinstance(pair, list) and len(pair) == 2 for pair in entries):
+            raise ValueError("CBOR map marker needs an entries array.")
+        return _MapPairs([(_decode_edit_marker(pair[0], kind), _decode_edit_marker(pair[1], kind))
+                          for pair in entries])
+
+    return {key: _decode_edit_marker(item, kind) for key, item in value.items()}
+
+
+def _invalid_marker() -> Any:
+    raise ValueError("Serialized map marker contains an invalid entry.")
+
+
+def _pack_msgpack(value: Any) -> bytes:
+    packer = msgpack.Packer(use_bin_type=True)
+
+    def pack(item: Any) -> bytes:
+        if isinstance(item, _MapPairs):
+            return packer.pack_map_header(len(item.pairs)) + b"".join(
+                pack(key) + pack(element) for key, element in item.pairs)
+        if isinstance(item, dict):
+            return packer.pack_map_header(len(item)) + b"".join(
+                pack(key) + pack(element) for key, element in item.items())
+        if isinstance(item, (list, tuple)):
+            return packer.pack_array_header(len(item)) + b"".join(pack(element) for element in item)
+        if isinstance(item, (set, frozenset)):
+            return packer.pack_array_header(len(item)) + b"".join(pack(element) for element in item)
+        try:
+            return packer.pack(item)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Unsupported MessagePack value: {exc}") from exc
+
+    return pack(value)
+
+
+def _cbor_header(major: int, value: int) -> bytes:
+    if value < 0:
+        raise ValueError("CBOR lengths and tags cannot be negative.")
+    if value < 24:
+        return bytes([(major << 5) | value])
+    if value <= 0xFF:
+        return bytes([(major << 5) | 24, value])
+    if value <= 0xFFFF:
+        return bytes([(major << 5) | 25]) + struct.pack(">H", value)
+    if value <= 0xFFFFFFFF:
+        return bytes([(major << 5) | 26]) + struct.pack(">I", value)
+    if value <= 0xFFFFFFFFFFFFFFFF:
+        return bytes([(major << 5) | 27]) + struct.pack(">Q", value)
+    raise ValueError("CBOR integer or length is too large.")
+
+
+def _pack_cbor(value: Any) -> bytes:
+    if value is None:
+        return b"\xf6"
+    if value is False:
+        return b"\xf4"
+    if value is True:
+        return b"\xf5"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _cbor_header(0, value) if value >= 0 else _cbor_header(1, -1 - value)
+    if isinstance(value, float):
+        return b"\xfb" + struct.pack(">d", value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        return _cbor_header(2, len(data)) + data
+    if isinstance(value, str):
+        data = value.encode("utf-8")
+        return _cbor_header(3, len(data)) + data
+    if isinstance(value, _CBORTag):
+        return _cbor_header(6, value.tag) + _pack_cbor(value.value)
+    if isinstance(value, _CBORSimple):
+        if value.value < 24:
+            return bytes([0xE0 | value.value])
+        if value.value <= 0xFF:
+            return b"\xf8" + bytes([value.value])
+        raise ValueError("CBOR simple value must be between 0 and 255.")
+    if isinstance(value, _MapPairs):
+        pairs = value.pairs
+        return _cbor_header(5, len(pairs)) + b"".join(_pack_cbor(key) + _pack_cbor(item) for key, item in pairs)
+    if isinstance(value, dict):
+        return _cbor_header(5, len(value)) + b"".join(_pack_cbor(key) + _pack_cbor(item)
+                                                     for key, item in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return _cbor_header(4, len(value)) + b"".join(_pack_cbor(item) for item in value)
+    raise ValueError(f"Unsupported CBOR value: {type(value).__name__}")
+
+
+def _encode_inner(text: str, kind: str) -> bytes:
+    if kind == "text":
+        try:
+            return text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Text contains characters that cannot be encoded as UTF-8.") from exc
+    if kind == "json":
+        return json.dumps(_edited_json(text), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if kind == "msgpack":
+        return _pack_msgpack(_decode_edit_marker(_edited_json(text), "msgpack"))
+    if kind == "cbor":
+        return _pack_cbor(_decode_edit_marker(_edited_json(text), "cbor"))
+    if kind == "bson":
+        try:
+            decoded = json_util.loads(text)
+            if not isinstance(decoded, dict):
+                raise ValueError("BSON root must be a JSON object.")
+            return BSON.encode(decoded)
+        except (ValueError, TypeError, BSONError, RecursionError, OverflowError) as exc:
+            raise ValueError(f"Invalid BSON Extended JSON: {exc}") from exc
+    raise ValueError(f"Format {kind!r} is not editable.")
+
+
+def encode_preview_value(original: str | bytes, format: str | tuple[str, ...], text: str) -> bytes:
+    """Encode an edited preview while retaining the detected serialization chain.
+
+    ``format`` may be a preview chain such as ``("gzip", "msgpack")`` or a
+    single format name. ``auto`` derives the chain from ``original``. Hex,
+    Base64 and unknown/failed previews intentionally remain read-only.
+    """
+    raw = raw_bytes(original)
+    if isinstance(format, (tuple, list)):
+        chain = tuple(format)
+    elif format == "auto":
+        detected = preview_value(raw, "auto")
+        chain = detected.chain or (detected.format,)
+    elif format in {"gzip", "zlib"}:
+        detected = preview_value(raw, format)
+        chain = detected.chain or (detected.format,)
+    else:
+        chain = (format,)
+    if not chain or chain[-1] in {"hex", "base64", "auto"}:
+        raise ValueError("This value does not have an editable serialization format.")
+    if len(chain) > MAX_COMPRESSION_LAYERS + 1:
+        raise ValueError("Serialization chain is too deep to edit safely.")
+    if any(layer not in {"gzip", "zlib"} for layer in chain[:-1]):
+        raise ValueError("Unsupported serialization wrapper.")
+    data = _encode_inner(text, chain[-1])
+    if len(data) > MAX_DECODE_BYTES:
+        raise ValueError("Encoded value exceeds the 1 MiB limit.")
+    for layer in reversed(chain[:-1]):
+        data = gzip.compress(data, mtime=0) if layer == "gzip" else zlib.compress(data)
+        if len(data) > MAX_DECODE_BYTES:
+            raise ValueError("Encoded compressed value exceeds the 1 MiB limit.")
+    return data

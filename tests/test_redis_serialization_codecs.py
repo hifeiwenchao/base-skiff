@@ -14,6 +14,7 @@ from baseskiff.redis_codec import (
     MAX_DECODE_BYTES,
     MAX_DEPTH,
     MAX_PREVIEW_CHARS,
+    encode_preview_value,
     preview_value,
     raw_bytes,
 )
@@ -216,3 +217,56 @@ def test_new_formats_respect_input_and_display_limits():
     preview = preview_value(large_cbor_text, "cbor")
     assert preview.format == "cbor" and preview.notice
     assert len(preview.text) <= MAX_PREVIEW_CHARS
+
+
+def test_editing_json_reencodes_the_original_value():
+    original = b'{"enabled":false,"items":[1,2]}'
+    encoded = encode_preview_value(original, ("json",), '{"enabled":true,"items":[1,2,3]}')
+    assert json.loads(encoded) == {"enabled": True, "items": [1, 2, 3]}
+
+
+def test_editing_messagepack_reencodes_binary_marker():
+    original = msgpack.packb({"payload": b"old"}, use_bin_type=True)
+    edited = '{"payload":{"$msgpack":"binary","base64":"bmV3"}}'
+    encoded = encode_preview_value(original, ("msgpack",), edited)
+    assert msgpack.unpackb(encoded, raw=False) == {"payload": b"new"}
+
+
+def test_editing_bson_extended_json_reencodes_types():
+    original = BSON.encode({"id": ObjectId("507f1f77bcf86cd799439011"), "n": Int64(1)})
+    edited = '{"id":{"$oid":"507f1f77bcf86cd799439011"},"n":{"$numberLong":"2"}}'
+    encoded = encode_preview_value(original, ("bson",), edited)
+    decoded = BSON(encoded).decode()
+    assert str(decoded["id"]) == "507f1f77bcf86cd799439011"
+    assert int(decoded["n"]) == 2
+
+
+def test_editing_cbor_reencodes_binary_and_tag_markers():
+    original = bytes.fromhex("a1 61 78 01")
+    edited = '{"x":{"$cbor":"tag","tag":1,"value":{"$cbor":"binary","base64":"/wA="}}}'
+    encoded = encode_preview_value(original, ("cbor",), edited)
+    assert json.loads(preview_value(encoded, "cbor").text) == json.loads(edited)
+
+
+@pytest.mark.parametrize("outer", ["gzip", "zlib"])
+def test_editing_compressed_chain_recompresses_inner_value(outer):
+    import gzip
+
+    original_inner = msgpack.packb({"count": 1}, use_bin_type=True)
+    original = gzip.compress(original_inner, mtime=0) if outer == "gzip" else zlib.compress(original_inner)
+    edited = '{"count":2}'
+    encoded = encode_preview_value(original, (outer, "msgpack"), edited)
+    preview = preview_value(encoded)
+    assert preview.chain == (outer, "msgpack")
+    assert json.loads(preview.text) == {"count": 2}
+
+
+@pytest.mark.parametrize("format_name", ["hex", "base64", "gzip", "zlib"])
+def test_editing_non_serialized_or_unknown_content_is_rejected(format_name):
+    with pytest.raises(ValueError):
+        encode_preview_value(b"raw", (format_name,), "changed")
+
+
+def test_editing_invalid_json_is_rejected():
+    with pytest.raises(ValueError):
+        encode_preview_value(b'{"x":1}', ("json",), '{"x":')

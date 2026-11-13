@@ -892,6 +892,23 @@ class RedisAdapter:
         return _redis_decode(value)
 
     @staticmethod
+    def _entry_value(payload, name):
+        """Return an entry value and whether it must be kept as raw bytes.
+
+        The regular ``value``/``expected`` fields retain the historical UTF-8
+        decoding behavior.  Serialized previews use explicit ``*_bytes``
+        fields so a valid UTF-8 byte sequence cannot be silently converted to
+        text before Redis receives it again.
+        """
+        raw_name = f"{name}_bytes"
+        if raw_name in payload:
+            value = payload[raw_name]
+            if not isinstance(value, (bytes, bytearray, memoryview)):
+                raise ValueError(f"Redis {raw_name} must be bytes.")
+            return bytes(value), True
+        return RedisAdapter._entry_text(payload, name), False
+
+    @staticmethod
     def _entry_score(value, *, allow_infinity=False):
         try:
             if isinstance(value, bool):
@@ -913,20 +930,28 @@ class RedisAdapter:
         if action not in {"add", "update", "delete"} or not isinstance(payload, dict):
             raise ValueError("Choose add, update or delete and supply entry values.")
         entry, value, expected = None, None, None
+        expected_raw = False
         if kind == "set" and action == "add":
-            entry = self._entry_text(payload, "entry" if "entry" in payload else "value")
+            entry_name = "entry" if "entry" in payload or "entry_bytes" in payload else "value"
+            entry, _ = self._entry_value(payload, entry_name)
         elif kind in {"hash", "set", "zset"}:
-            entry = self._entry_text(payload, "entry")
+            entry, _ = self._entry_value(payload, "entry")
         elif kind == "list" and action != "add":
             entry = payload.get("entry")
             if isinstance(entry, bool) or not isinstance(entry, int) or entry < 0:
                 raise ValueError("A Redis list index must be a nonnegative integer.")
         if action != "delete" and not (kind == "set" and action == "add"):
-            value = self._entry_score(payload.get("value")) if kind == "zset" else self._entry_text(payload, "value")
+            if kind == "zset":
+                value = self._entry_score(payload.get("value"))
+            else:
+                value, _ = self._entry_value(payload, "value")
         if action != "add" and kind != "set":
-            if "expected" not in payload:
+            if "expected" not in payload and "expected_bytes" not in payload:
                 raise ValueError("The original entry value is required. Refresh before saving again.")
-            expected = self._entry_score(payload["expected"], allow_infinity=True) if kind == "zset" else self._entry_text(payload, "expected")
+            if kind == "zset":
+                expected = self._entry_score(payload["expected"], allow_infinity=True)
+            else:
+                expected, expected_raw = self._entry_value(payload, "expected")
         watch_error = driver("redis").WatchError
         try:
             with self.session() as client, client.pipeline(transaction=True) as transaction:
@@ -936,12 +961,12 @@ class RedisAdapter:
                     raise ValueError("This Redis key is missing or its type changed. Refresh before saving again.")
                 if kind == "string":
                     exists = original_kind != "none"
-                    current = _redis_decode(transaction.get(key)) if exists else None
+                    current = transaction.get(key) if expected_raw and exists else (_redis_decode(transaction.get(key)) if exists else None)
                 elif kind == "hash":
-                    current = _redis_decode(transaction.hget(key, entry))
+                    current = transaction.hget(key, entry) if expected_raw else _redis_decode(transaction.hget(key, entry))
                     exists = current is not None
                 elif kind == "list":
-                    current = _redis_decode(transaction.lindex(key, entry)) if action != "add" else None
+                    current = (transaction.lindex(key, entry) if expected_raw else _redis_decode(transaction.lindex(key, entry))) if action != "add" else None
                     exists = current is not None
                 elif kind == "set":
                     exists = transaction.sismember(key, entry)
@@ -951,6 +976,8 @@ class RedisAdapter:
                     exists = current is not None
                 if action == "add" and kind != "list" and exists:
                     raise ValueError("This Redis entry already exists. Refresh before saving again.")
+                if expected_raw and current is not None:
+                    current = _redis_bytes(current)
                 if action != "add" and (not exists or (kind != "set" and current != expected)):
                     raise ValueError("This Redis entry is missing or changed. Refresh before saving again.")
                 if kind == "set" and action == "update" and value != entry and transaction.sismember(key, value):

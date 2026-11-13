@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from baseskiff.redis_codec import json_safe, preview_value, safe_text
+from baseskiff.redis_codec import encode_preview_value, json_safe, preview_value, safe_text
 from baseskiff.ui.icons import icon
 from baseskiff.ui.redis_preview import (
     RedisPreviewDialog,
@@ -66,6 +66,8 @@ _TEXT = {
         'view_field': '查看字段…', 'view_member': '查看成员…',
         'field_preview': '字段预览 · {format} · 只读',
         'member_preview': '成员预览 · {format} · 只读',
+        'serialized_hint': '已识别为 {format}；保存时按原格式编码。',
+        'serialized_error': '无法按 {format} 编码：{error}',
     },
     'en': {
         'refresh': 'Refresh', 'copy': 'Copy', 'edit': 'Edit', 'delete': 'Delete', 'view': 'View',
@@ -96,6 +98,8 @@ _TEXT = {
         'view_field': 'View field…', 'view_member': 'View member…',
         'field_preview': 'Field preview · {format} · read-only',
         'member_preview': 'Member preview · {format} · read-only',
+        'serialized_hint': 'Detected as {format}; saving will preserve the original format.',
+        'serialized_error': 'Could not encode as {format}: {error}',
     },
 }
 
@@ -119,6 +123,27 @@ def _raw(value: Any) -> str:
     if is_editable_text(value):
         return value
     return safe_text(value) if isinstance(value, (str, bytes)) else str(value)
+
+
+_EDITABLE_SERIALIZED_FORMATS = frozenset({'text', 'json', 'msgpack', 'bson', 'cbor', 'gzip', 'zlib'})
+
+
+def _serialized_preview(value: Any):
+    """Return a complete, lossless preview suitable for an edit draft.
+
+    Redis drivers expose binary values as bytes.  A preview that fell back to
+    Hex/Base64, was truncated, or contains an unknown module format cannot be
+    safely re-encoded, so those values stay on the read-only path.
+    """
+    if not isinstance(value, bytes):
+        return None
+    preview = preview_value(value)
+    chain = tuple(preview.chain or (preview.format,))
+    if not chain or any(name not in _EDITABLE_SERIALIZED_FORMATS for name in chain):
+        return None
+    if preview.notice:
+        return None
+    return preview
 
 
 class _RedisTTLDialog(QDialog):
@@ -206,6 +231,9 @@ class _RedisEntryDialog(QDialog):
         super().__init__(parent)
         self.kind, self.editing = kind, editing
         self._raw_entry = entry
+        self._raw_value = value
+        self._serialized_preview = _serialized_preview(value)
+        self._encoded_value: bytes | None = None
         self.preview_dialog: RedisPreviewDialog | None = None
         self._identity_visible = editing and kind in {'hash', 'zset'}
         self._entry_preview = preview_value(entry) if self._identity_visible else None
@@ -253,8 +281,11 @@ class _RedisEntryDialog(QDialog):
         layout.addWidget(self.entry_preview_notice)
         self.value_label = _label('fieldLabel')
         layout.addWidget(self.value_label)
-        self.value_editor = QPlainTextEdit(value if is_editable_text(value) else _raw(value))
+        initial_value = (self._serialized_preview.text if self._serialized_preview is not None
+                         else value if is_editable_text(value) else _raw(value))
+        self.value_editor = QPlainTextEdit(initial_value)
         self.value_editor.setObjectName('redisEntryValue')
+        self.value_editor.setReadOnly(self._serialized_preview is None and not is_editable_text(value))
         if kind == 'zset':
             self.value_editor.setMaximumHeight(85)
         layout.addWidget(self.value_editor, 1)
@@ -297,8 +328,13 @@ class _RedisEntryDialog(QDialog):
             self.entry_preview_notice.setText(preview_notice(self._entry_preview.notice, self.language))
         if self.preview_dialog is not None:
             self.preview_dialog.set_language(self.language)
-        self.hint_label.setText(tr('raw_hint'))
-        self.hint_label.setVisible(self.kind != 'zset')
+        if self._serialized_preview is not None:
+            self.hint_label.setText(tr('serialized_hint').format(
+                format=preview_format_label(self._serialized_preview, self.language)))
+            self.hint_label.setVisible(True)
+        else:
+            self.hint_label.setText(tr('raw_hint'))
+            self.hint_label.setVisible(self.kind != 'zset')
 
     def _show_identity_preview(self) -> None:
         if not self._identity_visible:
@@ -317,6 +353,20 @@ class _RedisEntryDialog(QDialog):
 
     def _submit(self) -> None:
         self.error_label.hide()
+        self._encoded_value = None
+        if self._serialized_preview is not None:
+            try:
+                self._encoded_value = encode_preview_value(
+                    self._raw_value, self._serialized_preview.chain or self._serialized_preview.format,
+                    self.value_editor.toPlainText())
+            except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError) as error:
+                self.error_label.setText(_TEXT[self.language]['serialized_error'].format(
+                    format=preview_format_label(self._serialized_preview, self.language), error=error))
+                self.error_label.show()
+                self.value_editor.setFocus()
+                return
+            self.accept()
+            return
         if (not is_editable_text(self.value_editor.toPlainText())
                 or not self.editing and self.kind in {'hash', 'zset'}
                 and not is_editable_text(self.entry_edit.text())):
@@ -334,6 +384,10 @@ class _RedisEntryDialog(QDialog):
                 self.value_editor.setFocus()
                 return
         self.accept()
+
+    @property
+    def serialized_value(self) -> bytes | None:
+        return self._encoded_value
 
 
 class RedisValueWidget(QWidget):
@@ -355,6 +409,10 @@ class RedisValueWidget(QWidget):
         self._busy = False
         self._rows: list[tuple[Any, Any]] = []
         self._row_buttons: list[tuple[QPushButton, QPushButton]] = []
+        # Keep serialized detection out of repeated selection/translation
+        # updates.  The raw bytes object is retained with the cached result so
+        # an id reused by Python cannot return a stale preview.
+        self._serialized_cache: dict[int, tuple[bytes, Any]] = {}
         self.entry_dialog: _RedisEntryDialog | None = None
         self._submitted_dialog: _RedisEntryDialog | None = None
         self._submitted_snapshot = None
@@ -469,12 +527,28 @@ class RedisValueWidget(QWidget):
     def _editable_string(self) -> bool:
         return self._kind == 'string' and is_editable_text(self.snapshot.value)
 
+    def _editable_serialized_string(self):
+        return (self._serialized_preview_for(self.snapshot.value)
+                if self._kind == 'string' and self.snapshot is not None else None)
+
+    def _serialized_preview_for(self, value: Any):
+        if not isinstance(value, bytes):
+            return None
+        key = id(value)
+        cached = self._serialized_cache.get(key)
+        if cached is not None and cached[0] is value:
+            return cached[1]
+        preview = _serialized_preview(value)
+        self._serialized_cache[key] = (value, preview)
+        return preview
+
     def set_value(self, snapshot, read_only: bool = False) -> None:
         self._close_dialogs()
         self._submitted_dialog = None
         self._submitted_snapshot = None
         previous_key = self.snapshot.key if self.snapshot is not None else None
         self.snapshot, self.read_only, self._busy = snapshot, read_only, False
+        self._serialized_cache.clear()
         if previous_key != (snapshot.key if snapshot is not None else None):
             self.entry_search.clear()
         self._rows = []
@@ -485,8 +559,10 @@ class RedisValueWidget(QWidget):
             self.string_editor.clear()
             self.stack.setCurrentWidget(self.empty_label)
         elif self._scalar:
-            self.string_editor.setPlainText(snapshot.value if self._editable_string()
-                                            else preview_value(snapshot.value).text)
+            serialized = self._editable_serialized_string()
+            self.string_editor.setPlainText(snapshot.value if self._editable_string() else
+                                            serialized.text if serialized is not None else
+                                            preview_value(snapshot.value).text)
             self.stack.setCurrentWidget(self.string_page)
         else:
             self.string_editor.clear()
@@ -552,9 +628,15 @@ class RedisValueWidget(QWidget):
         self.ttl_button.setText(self._tr('set_ttl'))
         self.add_button.setText(self._tr('add_' + self._kind if self._kind in
                                        {'hash', 'list', 'set', 'zset'} else 'add'))
-        hint = ('raw_hint' if self._editable_string() else 'binary_hint') if self._kind == 'string' else (
-            'dump_hint' if self._scalar and isinstance(self.snapshot.value, bytes) else 'scalar_hint')
-        self.raw_hint_label.setText(self._tr(hint))
+        serialized = self._editable_serialized_string()
+        if self._kind == 'string' and serialized is not None:
+            hint_text = self._tr('serialized_hint').format(
+                format=preview_format_label(serialized, self.language))
+        else:
+            hint = ('raw_hint' if self._editable_string() else 'binary_hint') if self._kind == 'string' else (
+                'dump_hint' if self._scalar and isinstance(self.snapshot.value, bytes) else 'scalar_hint')
+            hint_text = self._tr(hint)
+        self.raw_hint_label.setText(hint_text)
         self.entry_search.setPlaceholderText(self._tr('search'))
         self.entry_search.setToolTip(self._tr('search_hint'))
         self.entry_search.setVisible(self._kind in {'hash', 'list', 'set', 'zset', 'stream'})
@@ -667,14 +749,16 @@ class RedisValueWidget(QWidget):
     def _can_write(self) -> bool:
         return (not self.read_only and not self._busy
                 and self._kind in {'string', 'hash', 'list', 'set', 'zset'}
-                and (self._kind != 'string' or self._editable_string()))
+                and (self._kind != 'string' or self._editable_string()
+                     or self._editable_serialized_string() is not None))
 
     def _can_delete(self) -> bool:
         return self._can_write() and not (self._kind == 'list' and self.snapshot.truncated)
 
     def _can_edit_row(self, row: int) -> bool:
         return self._can_write() and 0 <= row < len(self._rows) and (
-            self._kind == 'zset' or is_editable_text(self._rows[row][1]))
+            self._kind == 'zset' or is_editable_text(self._rows[row][1]) or
+            self._serialized_preview_for(self._rows[row][1]) is not None)
 
     def _apply_filter(self) -> None:
         needle = self.entry_search.text().casefold()
@@ -699,9 +783,11 @@ class RedisValueWidget(QWidget):
         self.add_button.setEnabled(mutable and collection)
         self.edit_button.setEnabled(collection and selected and self._can_edit_row(self.table.currentRow()))
         self.delete_button.setEnabled(self._can_delete() and collection and selected)
-        self.save_button.setEnabled(mutable and self._editable_string()
+        self.save_button.setEnabled(mutable and (self._editable_string() or
+                                                 self._editable_serialized_string() is not None)
                                     and is_editable_text(self.string_editor.toPlainText()))
-        self.string_editor.setReadOnly(not (mutable and self._editable_string()))
+        self.string_editor.setReadOnly(not (mutable and (self._editable_string() or
+                                                         self._editable_serialized_string() is not None)))
         self.copy_button.setEnabled(self._scalar or bool(self._rows) and selected)
         self.view_button.setEnabled(self._scalar or bool(self._rows) and selected)
         self.json_button.setEnabled(self._scalar)
@@ -746,11 +832,20 @@ class RedisValueWidget(QWidget):
         def accepted() -> None:
             if not self._can_write():
                 return
-            payload = {'value': dialog.value_editor.toPlainText()}
+            payload = ({'value_bytes': dialog.serialized_value}
+                       if dialog.serialized_value is not None else
+                       {'value': dialog.value_editor.toPlainText()})
             if editing or self._kind in {'hash', 'zset'}:
                 payload['entry'] = entry if editing else dialog.entry_edit.text()
+                if editing and dialog.serialized_value is not None and isinstance(entry, bytes):
+                    payload['entry_bytes'] = entry
             if editing and self._kind in {'hash', 'list', 'zset'}:
-                payload['expected'] = old_value
+                if dialog.serialized_value is not None and isinstance(old_value, bytes):
+                    payload['expected_bytes'] = old_value
+                else:
+                    payload['expected'] = old_value
+            elif editing and dialog.serialized_value is not None and isinstance(old_value, bytes):
+                payload['expected_bytes'] = old_value
             self._submitted_dialog = dialog
             self._submitted_snapshot = self.snapshot
             self._emit_mutation('update' if editing else 'add', payload)
@@ -777,7 +872,20 @@ class RedisValueWidget(QWidget):
         self._emit_mutation('delete', payload)
 
     def _save_string(self) -> None:
-        if self._editable_string() and is_editable_text(self.string_editor.toPlainText()):
+        serialized = self._editable_serialized_string()
+        if serialized is not None and is_editable_text(self.string_editor.toPlainText()):
+            try:
+                encoded = encode_preview_value(
+                    self.snapshot.value, serialized.chain or serialized.format,
+                    self.string_editor.toPlainText())
+            except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError) as error:
+                self.notice_label.setText(self._tr('serialized_error').format(
+                    format=preview_format_label(serialized, self.language), error=error))
+                self.notice_label.show()
+                return
+            self.notice_label.hide()
+            self._emit_mutation('update', {'value_bytes': encoded, 'expected_bytes': self.snapshot.value})
+        elif self._editable_string() and is_editable_text(self.string_editor.toPlainText()):
             self._emit_mutation('update', {'value': self.string_editor.toPlainText(),
                                            'expected': self.snapshot.value})
 

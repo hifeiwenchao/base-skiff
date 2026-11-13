@@ -495,3 +495,65 @@ def test_ssh_redis_browser_operations_use_one_tunnel(redis_browser, monkeypatch)
     ssh.mutate_entry("record", "string", "update", {"expected": "old", "value": "new"})
     assert client.get("record") == "new"
     assert events == ["open", "close"] * 3
+
+
+@pytest.fixture
+def redis_raw_browser(monkeypatch):
+    client = fakeredis.FakeRedis(decode_responses=False)
+    adapter = RedisAdapter(Connection(name="Raw browser", kind="Redis"))
+
+    @contextmanager
+    def session():
+        yield client
+
+    monkeypatch.setattr(adapter, "session", session)
+    yield adapter, client
+    client.close()
+
+
+@pytest.mark.parametrize("kind,seed", [
+    ("string", b"\x81\xa1x\x01"),
+    ("hash", {b"field": b"\x81\xa1x\x01"}),
+    ("list", [b"\x81\xa1x\x01"]),
+    ("set", [b"\x81\xa1x\x01"]),
+])
+def test_serialized_entry_mutation_accepts_explicit_raw_bytes(redis_raw_browser, kind, seed):
+    adapter, client = redis_raw_browser
+    key = b"serialized"
+    replacement = b"\x81\xa1x\x02"
+    if kind == "string":
+        client.set(key, seed)
+        payload = {"expected_bytes": seed, "value_bytes": replacement}
+    elif kind == "hash":
+        client.hset(key, mapping=seed)
+        payload = {"entry": b"field", "expected_bytes": seed[b"field"], "value_bytes": replacement}
+    elif kind == "list":
+        client.rpush(key, *seed)
+        payload = {"entry": 0, "expected_bytes": seed[0], "value_bytes": replacement}
+    else:
+        client.sadd(key, *seed)
+        payload = {"entry": seed[0], "value_bytes": replacement}
+    client.pexpire(key, 60_000)
+
+    assert adapter.mutate_entry(key, kind, "update", payload).affected == 1
+    if kind == "string":
+        assert client.get(key) == replacement
+    elif kind == "hash":
+        assert client.hget(key, b"field") == replacement
+    elif kind == "list":
+        assert client.lindex(key, 0) == replacement
+    else:
+        assert client.smembers(key) == {replacement}
+    assert 59_000 <= client.pttl(key) <= 60_000
+
+
+def test_serialized_entry_mutation_rejects_stale_raw_bytes(redis_raw_browser):
+    adapter, client = redis_raw_browser
+    key = b"serialized"
+    client.set(key, b"\x81\xa1x\x01")
+
+    with pytest.raises(ValueError, match="changed"):
+        adapter.mutate_entry(key, "string", "update", {
+            "expected_bytes": b"\x81\xa1x\x00", "value_bytes": b"\x81\xa1x\x02",
+        })
+    assert client.get(key) == b"\x81\xa1x\x01"
