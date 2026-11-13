@@ -92,6 +92,8 @@ QPushButton#tableTabClose:hover { background: #dce8d7; }
 QPushButton#tableTabClose:pressed { background: #ccddc5; }
 QWidget#redisKeySearch { background: #f3f7ef; border: 1px solid #e0e8db; border-radius: 5px; padding: 0; }
 QWidget#redisKeySearch QLabel { background: transparent; border: none; font-size: 10px; }
-QWidget#redisKeySearch QLineEdit { min-width: 0; padding: 5px 3px; font-size: 11px; }
+QWidget#redisKeySearch QLineEdit { min-width: 0; min-height: 16px; max-height: 16px; padding: 5px 3px; font-size: 11px; }
+QWidget#redisKeySearch QLineEdit QToolButton { padding: 0; min-height: 0; border: none; background: transparent; }
+QPushButton#redisKeySearchSubmit { padding: 0; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; border-radius: 5px; }
 QWidget#redisKeySearch QComboBox { min-width: 0; padding: 4px 18px 4px 5px; font-size: 10px; }
 '''

@@ -18,14 +18,14 @@ Redis 使用原生键搜索与分类型值视图，支持中文 / English 即时
 
 ## 键搜索
 
-展开 DB 后，在该 DB 分支首行的搜索区输入内容，只搜索此 DB，仅可选择「前缀 / Prefix」或「精确 / Exact」。搜索区随当前 DB 移动，折叠分支时隐藏；输入与模式按连接及 DB 分别保留。按 Enter 可立即搜索，刷新按钮重新执行当前搜索。侧栏最上方的搜索仍用于筛选导航树。
+展开 DB 后，在该 DB 分支首行的搜索区输入内容，只搜索此 DB，仅可选择「前缀 / Prefix」或「精确 / Exact」。搜索区随当前 DB 移动，折叠分支时隐藏；输入与模式按连接及 DB 分别保留。输入、清空内容或切换模式只更新草稿，不查询 Redis。点击输入框右侧的搜索按钮或按 Enter 才提交搜索；目录刷新继续使用上次提交的条件，保留未提交的草稿。草稿有变更时暂停「加载更多」，提交或恢复上次条件后可继续。侧栏最上方的搜索仍用于筛选导航树。
 
 | 模式 | 匹配规则 | 示例 |
 | --- | --- | --- |
 | 前缀 | 字面前缀，`*`、`?`、`[]` 等字符不作为通配符 | `cache:` 查找以 `cache:` 开头的键 |
 | 精确 | 完整字面键名，使用 `EXISTS` | `cache:*` 只查找名为 `cache:*` 的键 |
 
-键搜索区分大小写，保留输入的空格，两种模式均将 `*`、`?`、`[]` 等字符按字面处理。前缀模式通过服务端 `SCAN MATCH` 扫描匹配键、去重，再批量执行 `TYPE` 获取类型并按分隔符建树，每批最多返回 **500 个匹配键**，保留游标并累计展示所有已加载结果，不限制为 500 个总数。每批最多执行 8 次 SCAN，稀疏搜索可能本批没有匹配键但仍需继续；「加载更多」保留到扫描结束。刷新或修改搜索条件会重新从头加载，续载失败保留已有结果，可再次重试。精确模式使用 `EXISTS` 直接检查完整键是否存在。
+键搜索区分大小写，保留输入的空格，两种模式均将 `*`、`?`、`[]` 等字符按字面处理。前缀模式通过服务端 `SCAN MATCH` 扫描匹配键、去重，再批量执行 `TYPE` 获取类型并按分隔符建树，每批最多返回 **500 个匹配键**，保留游标并累计展示所有已加载结果，不限制为 500 个总数。每批最多执行 8 次 SCAN，稀疏搜索可能本批没有匹配键但仍需继续；「加载更多」保留到扫描结束。刷新或提交新的搜索条件会重新从头加载，续载失败保留已有结果，可再次重试。精确模式使用 `EXISTS` 直接检查完整键是否存在。
 
 值视图中的「搜索已载入的预览 / Search loaded preview」只筛选当前预览内的字段、值、成员或分数：按字面子串匹配、不区分大小写，不向服务端查找其他条目。它与键树上方的搜索用途不同。
 
@@ -48,7 +48,7 @@ Redis 使用原生键搜索与分类型值视图，支持中文 / English 即时
 
 同一层可以同时包含目录与键。例如 `cache` 和 `cache:users:42` 可以共存；连续、开头或末尾的分隔符也会保留，对应的空目录段显示为「空 / empty」。没有匹配分隔符的键直接显示在所属 DB 下。目录计数是**当前已加载的后代键数量**，不代表服务端完整键数，随当前搜索与已完成批次变化，不受 500 个总数限制。
 
-搜索结果保留匹配键的父目录；清空搜索恢复原有展开状态。目录与键按 DB 分别识别，同名路径在不同 DB 中不会混用展开状态。刷新、重建列表和语言切换保留展开状态；主动打开其他键时展开其路径。连接根节点也有展开箭头，点击已载入且有子项的连接名称可收起整个键目录，当前工作区与查询内容保留。目录仅用于导航，不执行修改。
+搜索结果保留匹配键的父目录；清空内容并提交搜索后恢复原有展开状态。目录与键按 DB 分别识别，同名路径在不同 DB 中不会混用展开状态。刷新、重建列表和语言切换保留展开状态；主动打开其他键时展开其路径。连接根节点也有展开箭头，点击已载入且有子项的连接名称可收起整个键目录，当前工作区与查询内容保留。目录仅用于导航，不执行修改。点击 Key 打开新标签、切回已有标签和读取完成后均保留侧栏的横向与纵向滚动位置。
 
 加载完成后，侧栏在空闲或滚动时不重复重建键目录。搜索模式菜单在选中、按 Esc 或点击外部关闭后，仍会完成等待中的目录更新；隐藏已经关闭的控件不会触发额外刷新。每批最多 500 个、累计展示所有已加载键的规则保持不变。
 
@@ -79,18 +79,21 @@ String 点击「查看 / View」，集合先选中一行再点击「查看 / Vie
 
 | 格式 | 用途 |
 | --- | --- |
-| Auto | 先识别 JSON 和可打印 UTF-8 文本，再尝试完整的单个 MessagePack 对象，其他内容显示 Hex |
+| Auto | 先识别 JSON 和可打印 UTF-8 文本，再尝试完整的单个 MessagePack、BSON 或 CBOR 对象，以及完整的 gzip / zlib 压缩流；无法确定时显示 Hex |
 | Text | 文本视图，无效 UTF-8 或控制字符以转义形式显示 |
 | JSON | 只读格式化 JSON；无效数据或结构超限时显示提示并回退 Hex |
 | MessagePack | 只读解码完整单对象；无效、尾随多对象或结构超限时提示并回退 Hex |
+| BSON | 只读解码完整 BSON 文档，以 Extended JSON 保留 ObjectId、Decimal128、日期和二进制等类型 |
+| CBOR | 只读解码完整 CBOR 对象，保留标签、二进制、重复键和非字符串键；结构超限时提示并回退 Hex |
+| gzip / zlib | 解压完整的单一压缩流，再显示内部格式；尾随数据、校验错误或解压超限时回退 Hex |
 | Hex | 十六进制原始字节 |
 | Base64 | Base64 字节表示 |
 
-常见 MessagePack map 显示为 JSON 对象；二进制、扩展类型、时间戳及特殊浮点数带明确类型标记，含非字符串键或重复键的 map 使用 entries 数组，避免显示转换时丢失内容。Stream 等结构中的二进制字段带 Base64 标记。任意私有编码、压缩内容或需要专用 schema 的数据不保证能够识别，仍可用 Hex / Base64 检查字节。
+常见 MessagePack map 显示为 JSON 对象；二进制、扩展类型、时间戳及特殊浮点数带明确类型标记，含非字符串键或重复键的 map 使用 entries 数组，避免显示转换时丢失内容。BSON 使用 Extended JSON 保留 BSON 类型；CBOR 的标签、二进制、非字符串键和重复键也会保留。Stream 等结构中的二进制字段带 Base64 标记。任意私有编码或需要专用 schema 的数据不保证能够识别，仍可用 Hex / Base64 检查字节。
 
-解码输入上限为 **1 MiB**，单次显示上限为 **200,000 个字符**，另有结构深度和条目数限制；超过上限会提示或回退，不会阻止原始字节导出。在预览窗口点击「导出原始字节… / Export original bytes…」，保存的是该窗口持有的完整单值输入字节，文本使用 UTF-8，**不受预览截断影响**。集合结构本身不导出原始字节，应先选择独立的成员或字段值。复制取得的是当前显示文本，导出原始字节与 CSV 导出当前结果是不同操作。
+解码和解压输入上限为 **1 MiB**，单次显示上限为 **200,000 个字符**，另有结构深度和条目数限制；超过上限会提示或回退，不会阻止原始字节导出。gzip / zlib 必须是完整的单一流，尾随数据、校验错误和解压炸弹会回退 Hex。在预览窗口点击「导出原始字节… / Export original bytes…」，保存的是该窗口持有的完整单值输入字节，文本使用 UTF-8，**不受预览截断影响**。集合结构本身不导出原始字节，应先选择独立的成员或字段值。复制取得的是当前显示文本，导出原始字节与 CSV 导出当前结果是不同操作。
 
-RedisJSON 导出的输入来自 `JSON.GET` 响应。未知模块类型的 `DUMP` 结果包含 Redis 类型和校验信息，是序列化快照，不能视为业务原文；此回退不负责解析模块私有数据。JSON / MessagePack 预览不提供格式转换保存，也不执行任意对象反序列化。键树每批最多加载 **500 个匹配键**并累计展示，集合值仍最多预览 **1,000 项**。
+RedisJSON 导出的输入来自 `JSON.GET` 响应。未知模块类型的 `DUMP` 结果包含 Redis 类型和校验信息，是序列化快照，不能视为业务原文；此回退不负责解析模块私有数据。JSON / MessagePack / BSON / CBOR 预览不提供格式转换保存，也不执行任意对象反序列化。键树每批最多加载 **500 个匹配键**并累计展示，集合值仍最多预览 **1,000 项**。
 
 修改保留服务端绝对过期时间，避免保存时延长 TTL；乐观并发检查发现冲突后会要求刷新重试。只读连接禁用修改，操作会写入历史，直接连接与 SSH 隧道使用相同保护。
 
@@ -102,17 +105,17 @@ Redis 操作历史同时记录 DB 编号。双击历史记录会选择该记录�
 
 Navigation follows **connection → DB → key folders / keys**. Expanding a connection discovers DB metadata; expanding a DB loads up to 500 keys in one batch. Reopen it or click **Load more** to continue; every loaded key remains in the tree. A completed scan reopens from cache. Key search is the first row inside the active expanded DB and applies only to it. Each DB keeps its own search, mode and expansion state. Select a data row and click its edit button to edit it; double-clicking data rows has no special action.
 
-Key search supports only **Prefix** and **Exact**, with input and mode kept separately for each connection and DB. Prefix matches a literal prefix through server `SCAN MATCH`; Exact checks the complete literal key with `EXISTS`. Both modes are case sensitive, preserve spaces and treat `*`, `?` and `[]` literally. Each prefix batch returns at most **500 matching keys**, and the tree accumulates all loaded results. A batch makes at most eight SCAN calls, so sparse searches can return an empty batch with more scanning available. Refresh or a new search resets the scan; failed continuation preserves loaded keys for retry. Search inside the loaded value preview remains a case-insensitive literal substring filter over loaded fields, values, members or scores.
+Key search supports only **Prefix** and **Exact**, with input and mode kept separately for each connection and DB. Draft edits, clearing and mode changes do not query Redis: click the search button or press Enter to submit. Refresh keeps using the submitted filter and preserves the draft; Load more pauses while the draft differs. Opening keys retains the sidebar scroll position. Prefix matches a literal prefix through server `SCAN MATCH`; Exact checks the complete literal key with `EXISTS`. Both modes are case sensitive, preserve spaces and treat `*`, `?` and `[]` literally. Each prefix batch returns at most **500 matching keys**, and the tree accumulates all loaded results. A batch makes at most eight SCAN calls, so sparse searches can return an empty batch with more scanning available. Refresh or a new search resets the scan; failed continuation preserves loaded keys for retry. Search inside the loaded value preview remains a case-insensitive literal substring filter over loaded fields, values, members or scores.
 
 Redis bulk strings are arbitrary bytes. The driver keeps those bytes and converts only losslessly decoded UTF-8 to text, including keys, fields, members, nested command replies and Stream fields. Tree and table labels safely mark binary or special content and may shorten long labels; operations still address the complete original identifier bytes.
 
-Click **View** for a String, or select a collection row and click **View**. Hash and List rows preview their value; Set and ZSet rows preview their member. Stream rows open a field structure preview with a selector for an individual field value. The String **JSON preview** button opens the same read-only dialog. Choose **Auto / Text / JSON / MessagePack / Hex / Base64**. Auto tries JSON and printable UTF-8 before a complete single MessagePack object, then falls back to Hex. Invalid manual JSON or MessagePack shows a notice and Hex; Text escapes invalid UTF-8 and control characters. Switching formats never writes the decoded result back to Redis.
+Click **View** for a String, or select a collection row and click **View**. Hash and List rows preview their value; Set and ZSet rows preview their member. Stream rows open a field structure preview with a selector for an individual field value. The String **JSON preview** button opens the same read-only dialog. Choose **Auto / Text / JSON / MessagePack / BSON / CBOR / gzip / zlib / Hex / Base64**. Auto accepts complete single objects and tries JSON, printable UTF-8, MessagePack, BSON, CBOR, and complete gzip/zlib streams, then falls back to Hex. Compressed previews show the decompression and inner-format chain. Invalid manual JSON, MessagePack, BSON or CBOR shows a notice and Hex; Text escapes invalid UTF-8 and control characters. Switching formats never writes the decoded result back to Redis.
 
-MessagePack maps with unique string keys appear as normal JSON objects. Binary values, extension types, timestamps and special floats carry explicit type markers. Maps with non-string or duplicate keys use entries arrays to keep all data. Binary fields in structure previews use Base64 annotations. Private encodings, compressed content and formats requiring a specific schema may remain undecodable; Hex and Base64 still expose their bytes.
+MessagePack maps with unique string keys appear as normal JSON objects. Binary values, extension types, timestamps and special floats carry explicit type markers. Maps with non-string or duplicate keys use entries arrays to keep all data. BSON uses canonical Extended JSON for BSON types; CBOR preserves tags, binary values, duplicate keys and non-string keys. Binary fields in structure previews use Base64 annotations. Private encodings and formats requiring a specific schema may remain undecodable; Hex and Base64 still expose their bytes.
 
-Decoding accepts at most **1 MiB**, display shows at most **200,000 characters**, and structure depth and item counts are bounded. Limits produce a notice or fallback. **Export original bytes…** saves the dialog's complete scalar input bytes, using UTF-8 for text, without applying display truncation. Whole collection structures do not offer a raw-byte export; select an individual field or member first. Copying captures displayed text, and CSV export still covers only the displayed result or page.
+Decoding and decompression accept at most **1 MiB**, display shows at most **200,000 characters**, and structure depth and item counts are bounded. Limits produce a notice or Hex fallback. gzip/zlib require one complete stream, so trailing data, checksum failures and decompression bombs fall back to Hex. **Export original bytes…** saves the dialog's complete scalar input bytes, using UTF-8 for text, without applying display truncation. Whole collection structures do not offer a raw-byte export; select an individual field or member first. Copying captures displayed text, and CSV export still covers only the displayed result or page.
 
-RedisJSON uses read-only `JSON.GET`; its export contains that response. Unknown module types use read-only `DUMP`, whose bytes are Redis serialization with type and checksum information rather than the original application payload. This fallback does not interpret private module schemas. JSON and MessagePack previews do not provide conversion-and-save or executable object deserialization.
+RedisJSON uses read-only `JSON.GET`; its export contains that response. Unknown module types use read-only `DUMP`, whose bytes are Redis serialization with type and checksum information rather than the original application payload. This fallback does not interpret private module schemas. JSON, MessagePack, BSON and CBOR previews do not provide conversion-and-save or executable object deserialization.
 
 Ordinary text CRUD preserves its contents without automatic number or JSON conversion. Binary content and text that Qt cannot preserve losslessly cannot be edited as raw text. This includes embedded controls, lone surrogates, carriage returns, nonbreaking spaces and paragraph separators; normal newlines and tabs remain editable. Such collection entries can still be previewed, exported and deleted under the existing rules, and the main window supports whole-key deletion. Editing a Hash text value or ZSet score preserves binary identifier bytes. Read-only connections continue to prohibit writes. The **500 keys per load** and **1,000 collection items per preview** limits, List deletion requirements, TTL preservation and conflict checks still apply.
 

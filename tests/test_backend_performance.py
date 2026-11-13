@@ -198,3 +198,48 @@ def test_redis_query_set_response_keeps_all_members(monkeypatch):
     assert {row['value'] for row in result.rows} == {'text', b'\xff'}
     assert result.affected == 2
     assert not result.truncated
+
+
+def test_sql_session_does_not_mask_the_original_query_error_when_rollback_fails(monkeypatch):
+    class BrokenConnection:
+        def commit(self):
+            pass
+
+        def rollback(self):
+            raise RuntimeError('(0, "")')
+
+        def close(self):
+            pass
+
+    adapter = SQLAdapter(Connection(name='Broken MySQL', kind='MySQL'))
+    monkeypatch.setattr(adapter, '_open', lambda: BrokenConnection())
+    with pytest.raises(TimeoutError, match='query timed out'):
+        with adapter.session():
+            raise TimeoutError('query timed out')
+
+
+def test_mysql_unfiltered_page_uses_fast_catalog_row_estimate_instead_of_full_count(monkeypatch):
+    adapter = SQLAdapter(Connection(name='Large MySQL', kind='MySQL', database='leisu_www'))
+    monkeypatch.setattr(adapter, 'get_schema', lambda _table: [
+        __import__('baseskiff.models', fromlist=['ColumnInfo']).ColumnInfo('id', 'BIGINT', True),
+    ])
+    calls = []
+
+    @contextmanager
+    def session():
+        yield object()
+
+    def query(_db, sql, values=(), **_kwargs):
+        calls.append((sql, values))
+        if 'information_schema.TABLES' in sql:
+            return __import__('baseskiff.models', fromlist=['QueryResult']).QueryResult(rows=[{'count_rows': 2_750_392}])
+        return __import__('baseskiff.models', fromlist=['QueryResult']).QueryResult(
+            columns=['id'], rows=[{'id': 51}], total=1)
+
+    monkeypatch.setattr(adapter, 'session', session)
+    monkeypatch.setattr(adapter, '_query', query)
+    result = adapter.fetch_rows('members', page=2, page_size=50)
+    assert result.total == 2_750_392
+    assert len(result.rows) == 1
+    assert not any('COUNT(*)' in sql for sql, _values in calls)
+    assert any('information_schema.TABLES' in sql for sql, _values in calls)

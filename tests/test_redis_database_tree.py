@@ -112,7 +112,6 @@ def window(qtbot, tmp_path, monkeypatch):
     widget.rebuild_tree()
     widget.update_context()
     yield widget
-    widget.redis_key_timer.stop()
     widget.close()
 
 
@@ -167,7 +166,6 @@ def test_search_survives_tree_rebuild_and_preserves_utf16_selection(window, qtbo
     run_pending(window)
     search = window.redis_key_search
     search.setText('team:😀:order')
-    window.redis_key_timer.stop()
     search.setFocus()
     search.setSelection(5, 2)  # QLineEdit positions count UTF-16 units.
     qtbot.waitUntil(search.hasFocus)
@@ -179,7 +177,6 @@ def test_search_survives_tree_rebuild_and_preserves_utf16_selection(window, qtbo
         assert search.isVisible() and search.hasFocus()
         assert search.selectedText() == '😀'
         assert search.selectionStart() == 5 and search.cursorPosition() == 7
-    window.redis_key_timer.stop()
     window.query_editor.setFocus()
     qtbot.waitUntil(window.query_editor.hasFocus)
     window.rebuild_tree()
@@ -258,7 +255,6 @@ def test_late_db_search_updates_its_branch_without_replacing_active_search(windo
     run_pending(window)
     assert window.current_connection.database == '1'
     window.redis_key_search.setText('current:')
-    window.redis_key_timer.stop()
     old_request[1](RedisKeyPage([TableInfo('team:late')]))
     assert window.current_connection.database == '1'
     assert window.redis_key_search.text() == 'current:'
@@ -325,7 +321,7 @@ def test_embedded_search_fits_sidebar_and_keeps_inputs_visible(window, qtbot, wi
     assert host is not None
     def visible_controls_fit():
         viewport = window.tree.viewport()
-        for control in (window.redis_key_search, window.redis_key_mode):
+        for control in (window.redis_key_search, window.redis_key_search_button, window.redis_key_mode):
             rectangle = control.rect()
             rectangle.moveTopLeft(control.mapTo(viewport, rectangle.topLeft()))
             assert viewport.rect().contains(rectangle), search_geometry(window)
@@ -341,6 +337,11 @@ def test_embedded_search_fits_sidebar_and_keeps_inputs_visible(window, qtbot, wi
     mode_rect.moveTopLeft(window.redis_key_mode.mapTo(window.tree.viewport(), mode_rect.topLeft()))
     assert window.tree.viewport().rect().contains(mode_rect)
     assert window.redis_key_search.width() >= 60
+    button_rect = window.redis_key_search_button.geometry()
+    input_rect = window.redis_key_search.geometry()
+    assert button_rect.left() > input_rect.right()
+    assert button_rect.center().y() == input_rect.center().y()
+    assert window.redis_key_search_button.height() >= 24
     assert window.redis_key_mode.width() >= 65, 'Prefix/Exact must remain readable and clickable'
     assert window.redis_key_mode.height() >= 22
 
@@ -373,7 +374,7 @@ def test_embedded_search_stays_visible_when_editor_requests_full_item_width(
     host.resize(window.tree.visualItemRect(search_row).width(), host.height())
     host.layout().activate()
     window.redis_search_group.layout().activate()
-    for control in (host, window.redis_key_search, window.redis_key_mode):
+    for control in (host, window.redis_key_search, window.redis_key_search_button, window.redis_key_mode):
         rectangle = control.rect()
         rectangle.moveTopLeft(control.mapTo(window.tree.viewport(), rectangle.topLeft()))
         assert window.tree.viewport().rect().contains(rectangle), search_geometry(window)

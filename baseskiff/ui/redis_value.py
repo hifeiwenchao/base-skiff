@@ -6,9 +6,11 @@ import math
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -27,7 +29,12 @@ from PySide6.QtWidgets import (
 
 from baseskiff.redis_codec import json_safe, preview_value, safe_text
 from baseskiff.ui.icons import icon
-from baseskiff.ui.redis_preview import RedisPreviewDialog, is_editable_text
+from baseskiff.ui.redis_preview import (
+    RedisPreviewDialog,
+    is_editable_text,
+    preview_format_label,
+    preview_notice,
+)
 
 _TEXT = {
     'zh': {
@@ -54,6 +61,11 @@ _TEXT = {
         'unsafe_text': '文本包含无法无损编辑的特殊字符；请使用只读预览。',
         'search': '搜索已载入的预览…',
         'search_hint': '仅搜索当前已载入预览中的字段、值、成员或分数。',
+        'set_ttl': '设置 TTL', 'ttl_title': '设置 Redis TTL', 'ttl_seconds': '秒数',
+        'ttl_no_expiry': '永久（不设置过期）', 'ttl_error': '请输入 1 到 2,147,483,647 之间的整数秒。',
+        'view_field': '查看字段…', 'view_member': '查看成员…',
+        'field_preview': '字段预览 · {format} · 只读',
+        'member_preview': '成员预览 · {format} · 只读',
     },
     'en': {
         'refresh': 'Refresh', 'copy': 'Copy', 'edit': 'Edit', 'delete': 'Delete', 'view': 'View',
@@ -79,6 +91,11 @@ _TEXT = {
         'unsafe_text': 'This text contains special characters that cannot be edited losslessly. Use the read-only preview.',
         'search': 'Search loaded preview…',
         'search_hint': 'Search fields, values, members or scores within the loaded preview only.',
+        'set_ttl': 'Set TTL', 'ttl_title': 'Set Redis TTL', 'ttl_seconds': 'Seconds',
+        'ttl_no_expiry': 'No expiry', 'ttl_error': 'Enter an integer from 1 to 2,147,483,647 seconds.',
+        'view_field': 'View field…', 'view_member': 'View member…',
+        'field_preview': 'Field preview · {format} · read-only',
+        'member_preview': 'Member preview · {format} · read-only',
     },
 }
 
@@ -104,13 +121,96 @@ def _raw(value: Any) -> str:
     return safe_text(value) if isinstance(value, (str, bytes)) else str(value)
 
 
+class _RedisTTLDialog(QDialog):
+    """Validate an absolute Redis expiration request without zero/negative deletes."""
+
+    def __init__(self, language: str, *, current_seconds: int | None,
+                 parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName('redisTTLDialog')
+        self.resize(430, 190)
+        self.language = language if language in _TEXT else 'en'
+        layout = QVBoxLayout(self)
+        self.title_label = _label('dialogTitle')
+        layout.addWidget(self.title_label)
+        form = QFormLayout()
+        self.seconds_label = _label('fieldLabel')
+        self.seconds_edit = QLineEdit()
+        self.seconds_edit.setObjectName('redisTTLSeconds')
+        self.seconds_edit.setValidator(QIntValidator(1, 2_147_483_647, self.seconds_edit))
+        if current_seconds is not None and current_seconds > 0:
+            self.seconds_edit.setText(str(current_seconds))
+        form.addRow(self.seconds_label, self.seconds_edit)
+        layout.addLayout(form)
+        self.no_expiry = QCheckBox()
+        self.no_expiry.setObjectName('redisTTLNoExpiry')
+        self.no_expiry.setChecked(current_seconds is None)
+        layout.addWidget(self.no_expiry)
+        self.error_label = _label('error')
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.cancel_button = _button('secondaryButton')
+        self.save_button = _button('primaryButton')
+        self.save_button.setDefault(True)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.save_button)
+        layout.addLayout(buttons)
+        self.no_expiry.toggled.connect(self.seconds_edit.setDisabled)
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button.clicked.connect(self._submit)
+        self.set_language(self.language)
+        self.seconds_edit.setDisabled(self.no_expiry.isChecked())
+
+    def set_language(self, language: str) -> None:
+        self.language = language if language in _TEXT else 'en'
+        tr = _TEXT[self.language].__getitem__
+        self.setWindowTitle(tr('ttl_title'))
+        self.title_label.setText(tr('ttl_title'))
+        self.seconds_label.setText(tr('ttl_seconds'))
+        self.seconds_edit.setPlaceholderText(tr('ttl_seconds'))
+        # The form row has no dedicated label to keep the dialog compact.
+        self.no_expiry.setText(tr('ttl_no_expiry'))
+        self.cancel_button.setText(tr('cancel'))
+        self.save_button.setText(tr('save'))
+        if self.error_label.isVisible():
+            self.error_label.setText(tr('ttl_error'))
+
+    def _submit(self) -> None:
+        if self.no_expiry.isChecked():
+            self.accept()
+            return
+        value = self.seconds_edit.text().strip()
+        try:
+            valid = 1 <= int(value) <= 2_147_483_647 and str(int(value)) == value.lstrip('0')
+        except ValueError:
+            valid = False
+        if not valid:
+            self.error_label.setText(_TEXT[self.language]['ttl_error'])
+            self.error_label.show()
+            self.seconds_edit.setFocus()
+            return
+        self.accept()
+
+    def seconds(self) -> int | None:
+        return None if self.no_expiry.isChecked() else int(self.seconds_edit.text())
+
+
 class _RedisEntryDialog(QDialog):
-    """A focused raw-text editor. Entry identity cannot change during hash/zset edits."""
+    """Edit raw text and inspect serialized identities without changing their bytes."""
 
     def __init__(self, kind: str, language: str, *, editing: bool,
                  entry: Any = '', value: Any = '', parent: QWidget) -> None:
         super().__init__(parent)
         self.kind, self.editing = kind, editing
+        self._raw_entry = entry
+        self.preview_dialog: RedisPreviewDialog | None = None
+        self._identity_visible = editing and kind in {'hash', 'zset'}
+        self._entry_preview = preview_value(entry) if self._identity_visible else None
+        show_preview = self._identity_visible and (
+            not is_editable_text(entry) or self._entry_preview.format not in {'text', 'hex', 'base64'})
         self.setObjectName('redisEntryDialog')
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.resize(600, 370)
@@ -126,12 +226,37 @@ class _RedisEntryDialog(QDialog):
         self.entry_edit.setReadOnly(editing)
         self.entry_edit.setVisible(kind in {'hash', 'zset', 'list'})
         self.entry_label.setVisible(kind in {'hash', 'zset', 'list'})
-        form.addRow(self.entry_label, self.entry_edit)
+        identity_row = QHBoxLayout()
+        identity_row.addWidget(self.entry_edit, 1)
+        self.entry_view_button = _button('redisEntryViewIdentity')
+        self.entry_view_button.setVisible(self._identity_visible)
+        identity_row.addWidget(self.entry_view_button)
+        form.addRow(self.entry_label, identity_row)
         layout.addLayout(form)
+        self.entry_preview_label = _label('fieldLabel')
+        self.entry_preview_label.setWordWrap(True)
+        self.entry_preview_label.setVisible(show_preview)
+        layout.addWidget(self.entry_preview_label)
+        self.entry_preview_editor = QPlainTextEdit()
+        self.entry_preview_editor.setObjectName('redisEntryIdentityPreview')
+        self.entry_preview_editor.setReadOnly(True)
+        self.entry_preview_editor.setMinimumHeight(110)
+        self.entry_preview_editor.setMaximumHeight(220)
+        self.entry_preview_editor.setVisible(show_preview)
+        if show_preview:
+            self.entry_preview_editor.setPlainText(self._entry_preview.text)
+            self.resize(660, 540)
+        layout.addWidget(self.entry_preview_editor, 1 if show_preview else 0)
+        self.entry_preview_notice = _label()
+        self.entry_preview_notice.setWordWrap(True)
+        self.entry_preview_notice.setVisible(show_preview and bool(self._entry_preview.notice))
+        layout.addWidget(self.entry_preview_notice)
         self.value_label = _label('fieldLabel')
         layout.addWidget(self.value_label)
         self.value_editor = QPlainTextEdit(value if is_editable_text(value) else _raw(value))
         self.value_editor.setObjectName('redisEntryValue')
+        if kind == 'zset':
+            self.value_editor.setMaximumHeight(85)
         layout.addWidget(self.value_editor, 1)
         self.hint_label = _label()
         self.hint_label.setWordWrap(True)
@@ -150,6 +275,7 @@ class _RedisEntryDialog(QDialog):
         layout.addLayout(buttons)
         self.cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self._submit)
+        self.entry_view_button.clicked.connect(self._show_identity_preview)
         self.set_language(language)
 
     def set_language(self, language: str) -> None:
@@ -164,8 +290,23 @@ class _RedisEntryDialog(QDialog):
                                     'member' if self.kind == 'set' else 'value'))
         self.save_button.setText(tr('save' if self.editing else 'add'))
         self.cancel_button.setText(tr('cancel'))
+        self.entry_view_button.setText(tr('view_field' if self.kind == 'hash' else 'view_member'))
+        if self._entry_preview is not None:
+            self.entry_preview_label.setText(tr('field_preview' if self.kind == 'hash' else 'member_preview').format(
+                format=preview_format_label(self._entry_preview, self.language)))
+            self.entry_preview_notice.setText(preview_notice(self._entry_preview.notice, self.language))
+        if self.preview_dialog is not None:
+            self.preview_dialog.set_language(self.language)
         self.hint_label.setText(tr('raw_hint'))
         self.hint_label.setVisible(self.kind != 'zset')
+
+    def _show_identity_preview(self) -> None:
+        if not self._identity_visible:
+            return
+        if self.preview_dialog is not None:
+            self.preview_dialog.close()
+        self.preview_dialog = RedisPreviewDialog(self._raw_entry, self.language, parent=self)
+        self.preview_dialog.open()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -204,6 +345,7 @@ class RedisValueWidget(QWidget):
 
     mutation_requested = Signal(str, object)
     refresh_requested = Signal()
+    ttl_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None, language: str = 'zh') -> None:
         super().__init__(parent)
@@ -217,6 +359,8 @@ class RedisValueWidget(QWidget):
         self._submitted_dialog: _RedisEntryDialog | None = None
         self._submitted_snapshot = None
         self.preview_dialog: QDialog | None = None
+        self.ttl_dialog: _RedisTTLDialog | None = None
+        self._ttl_snapshot = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(13)
@@ -237,6 +381,8 @@ class RedisValueWidget(QWidget):
         self.mode_label = _label('statusBadge')
         metadata.addWidget(self.count_label)
         metadata.addWidget(self.ttl_label)
+        self.ttl_button = _button('redisSetTTL')
+        metadata.addWidget(self.ttl_button)
         metadata.addStretch()
         metadata.addWidget(self.mode_label)
         layout.addLayout(metadata)
@@ -300,6 +446,7 @@ class RedisValueWidget(QWidget):
         self.delete_button.clicked.connect(self._delete_selected)
         self.save_button.clicked.connect(self._save_string)
         self.json_button.clicked.connect(self._show_json)
+        self.ttl_button.clicked.connect(self._open_ttl_dialog)
         self.table.itemSelectionChanged.connect(self._update_controls)
         self.entry_search.textChanged.connect(self._apply_filter)
         self.string_editor.textChanged.connect(self._update_controls)
@@ -364,9 +511,11 @@ class RedisValueWidget(QWidget):
         self.set_value(None)
 
     def _close_dialogs(self) -> None:
-        for dialog in (self.entry_dialog, self.preview_dialog):
+        for dialog in (self.entry_dialog, self.preview_dialog, self.ttl_dialog):
             if dialog is not None:
                 dialog.close()
+        self.ttl_dialog = None
+        self._ttl_snapshot = None
 
     def set_language(self, language: str) -> None:
         self.language = language if language in _TEXT else 'en'
@@ -375,6 +524,8 @@ class RedisValueWidget(QWidget):
             self.entry_dialog.set_language(self.language)
         if self.preview_dialog is not None:
             self.preview_dialog.set_language(self.language)
+        if self.ttl_dialog is not None:
+            self.ttl_dialog.set_language(self.language)
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -398,6 +549,7 @@ class RedisValueWidget(QWidget):
                             (self.edit_button, 'edit'), (self.delete_button, 'delete'),
                             (self.save_button, 'save_value'), (self.json_button, 'json')):
             button.setText(self._tr(key))
+        self.ttl_button.setText(self._tr('set_ttl'))
         self.add_button.setText(self._tr('add_' + self._kind if self._kind in
                                        {'hash', 'list', 'set', 'zset'} else 'add'))
         hint = ('raw_hint' if self._editable_string() else 'binary_hint') if self._kind == 'string' else (
@@ -413,7 +565,7 @@ class RedisValueWidget(QWidget):
         unit = 'bytes' if self._scalar else 'entries'
         self.count_label.setText(f'{size:,} {self._tr(unit)}' if self.snapshot is not None else '')
         ttl = self.snapshot.ttl_ms if self.snapshot is not None else -1
-        ttl_text = self._tr('no_expiry') if ttl == -1 else self._tr('expired') if ttl == -2 else f'{ttl / 1000:g} {self._tr("seconds")}'
+        ttl_text = self._tr('no_expiry') if ttl == -1 else self._tr('expired') if ttl == -2 else f'{self._format_ttl_seconds(ttl)} {self._tr("seconds")}'
         self.ttl_label.setText(f'{self._tr("ttl")}: {ttl_text}' if self.snapshot is not None else '')
         self.mode_label.setText(self._tr('stream_readonly' if self._kind == 'stream' else 'readonly'))
         self.mode_label.setVisible(self.read_only or self._kind == 'stream')
@@ -429,6 +581,42 @@ class RedisValueWidget(QWidget):
             delete.setToolTip(self._tr('delete'))
             delete.setAccessibleName(self._tr('delete'))
         self._update_controls()
+
+    @staticmethod
+    def _format_ttl_seconds(ttl_ms: int) -> str:
+        """Format milliseconds with fixed-point output, never scientific notation."""
+        if ttl_ms % 1000 == 0:
+            return f'{ttl_ms // 1000:,}'
+        whole, remainder = divmod(ttl_ms, 1000)
+        fraction = f'{remainder:03d}'.rstrip('0')
+        return f'{whole:,}.{fraction}'
+
+    def _open_ttl_dialog(self) -> None:
+        snapshot = self.snapshot
+        if snapshot is None or self._kind in {'none', 'missing'} or self.read_only or self._busy:
+            return
+        current = snapshot.ttl_ms
+        current_seconds = None if current == -1 else max(1, int(current // 1000)) if current > 0 else None
+        dialog = _RedisTTLDialog(self.language, current_seconds=current_seconds, parent=self)
+        self.ttl_dialog = dialog
+        self._ttl_snapshot = snapshot
+
+        def accepted() -> None:
+            # A late dialog result must never target a different key/view.
+            if self.snapshot is not snapshot or self.ttl_dialog is not dialog:
+                return
+            self.ttl_requested.emit(dialog.seconds())
+            self.ttl_dialog = None
+            self._ttl_snapshot = None
+
+        dialog.accepted.connect(accepted)
+        dialog.rejected.connect(lambda: self._clear_ttl_dialog(dialog))
+        dialog.open()
+
+    def _clear_ttl_dialog(self, dialog: _RedisTTLDialog) -> None:
+        if self.ttl_dialog is dialog:
+            self.ttl_dialog = None
+            self._ttl_snapshot = None
 
     def _column_labels(self) -> list[str]:
         keys = {'hash': ['field', 'value'], 'list': ['index', 'value'],
@@ -518,6 +706,8 @@ class RedisValueWidget(QWidget):
         self.view_button.setEnabled(self._scalar or bool(self._rows) and selected)
         self.json_button.setEnabled(self._scalar)
         self.refresh_button.setEnabled(self.snapshot is not None and not self._busy)
+        self.ttl_button.setEnabled(self.snapshot is not None and self._kind not in {'none', 'missing'}
+                                   and not self.read_only and not self._busy)
         for row, (edit, delete) in enumerate(self._row_buttons):
             edit.setEnabled(self._can_edit_row(row))
             delete.setEnabled(self._can_delete())
@@ -614,12 +804,14 @@ class RedisValueWidget(QWidget):
     def _show_row_preview(self, row: int) -> None:
         if 0 <= row < len(self._rows):
             entry, value = self._rows[row]
-            self._open_preview(entry if self._kind in {'set', 'zset'} else value)
+            self._open_preview(entry if self._kind in {'set', 'zset'} else value,
+                               identity=entry if self._kind == 'hash' else None)
 
-    def _open_preview(self, value: Any, *, format: str = 'auto') -> None:
+    def _open_preview(self, value: Any, *, format: str = 'auto',
+                      identity: str | bytes | None = None) -> None:
         if self.preview_dialog is not None:
             self.preview_dialog.close()
-        dialog = RedisPreviewDialog(value, self.language, format=format, parent=self)
+        dialog = RedisPreviewDialog(value, self.language, format=format, identity=identity, parent=self)
         self.preview_editor = dialog.editor
         self.preview_dialog = dialog
         dialog.open()

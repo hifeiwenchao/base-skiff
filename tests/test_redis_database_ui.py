@@ -32,7 +32,6 @@ def window(qtbot, tmp_path, monkeypatch):
     seed_database(widget, redis, [])
     widget.update_context()
     yield widget
-    widget.redis_key_timer.stop()
     widget.close()
 
 

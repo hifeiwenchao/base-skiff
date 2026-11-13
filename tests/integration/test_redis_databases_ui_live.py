@@ -67,7 +67,6 @@ def test_native_database_tree_browses_and_edits_only_selected_database(qtbot, li
         assert errors == []
     finally:
         if widget is not None:
-            widget.redis_key_timer.stop()
             qtbot.waitUntil(lambda: not widget.busy, timeout=15000)
             widget.close()
         for client in clients:

@@ -142,6 +142,22 @@ class SQLAdapter:
             return ".".join(self.quote(part) for part in table.split(".", 1))
         return self.quote(table)
 
+    @staticmethod
+    def _custom_fragment(fragment, keyword, label):
+        """Normalize a read-only WHERE/ORDER BY fragment from the grid toolbar."""
+        if fragment is None:
+            return ""
+        if not isinstance(fragment, str):
+            raise ValueError(f"Invalid {label} condition.")
+        value = fragment.strip()
+        if re.match(rf"^{re.escape(keyword)}\b", value, re.IGNORECASE):
+            value = value[len(keyword):].strip()
+        if not value:
+            return ""
+        if any(token in value for token in ("\x00", ";", "--", "/*", "*/")):
+            raise ValueError(f"Invalid {label} condition: multiple statements and comments are not allowed.")
+        return value
+
     def binds(self, count: int, offset=0) -> list[str]:
         if self.kind == "Oracle":
             return [f":{index + offset + 1}" for index in range(count)]
@@ -223,7 +239,13 @@ class SQLAdapter:
             yield db
             db.commit()
         except BaseException:
-            db.rollback()
+            # A timed-out MySQL socket may already be closed. Never let a
+            # cleanup error such as ``InterfaceError(0, '')`` replace the
+            # query/connection error that explains the failed operation.
+            try:
+                db.rollback()
+            except BaseException:
+                pass
             raise
         finally:
             db.close()
@@ -319,13 +341,16 @@ class SQLAdapter:
             rows = self._query(db, "SELECT c.column_name, c.data_type, c.nullable, c.data_default, CASE WHEN p.column_name IS NULL THEN 0 ELSE 1 END AS pk FROM user_tab_columns c LEFT JOIN (SELECT k.column_name, k.table_name FROM user_cons_columns k JOIN user_constraints t ON k.constraint_name=t.constraint_name WHERE t.constraint_type='P') p ON p.table_name=c.table_name AND p.column_name=c.column_name WHERE c.table_name=:1 ORDER BY c.column_id", (name,)).rows
             return [ColumnInfo(row["COLUMN_NAME"], row["DATA_TYPE"], bool(row["PK"]), row["NULLABLE"] == "Y", row["DATA_DEFAULT"]) for row in rows]
 
-    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False):
+    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by=""):
         columns = self.get_schema(table)
         names = [column.name for column in columns]
         if sort_column and sort_column not in names:
             raise ValueError("Unknown sort column.")
+        custom_where = self._custom_fragment(where_clause, "WHERE", "WHERE")
+        custom_order = self._custom_fragment(order_by, "ORDER BY", "ORDER BY")
         page, page_size = max(1, int(page)), max(1, min(MAX_ROWS, int(page_size)))
-        where, values = "", []
+        conditions, values = [], []
         if search:
             escaped = search.replace("!", "!!").replace("%", "!%").replace("_", "!_")
             casts = []
@@ -342,12 +367,30 @@ class SQLAdapter:
                     target = f"CAST({target} AS {'CHAR' if self.kind == 'MySQL' else 'TEXT'})"
                 casts.append(f"{target} LIKE {self.binds(1, len(values))[0]} ESCAPE '!' ")
                 values.append(f"%{escaped}%")
-            where = " WHERE (" + " OR ".join(casts) + ")" if casts else " WHERE 1=0"
+            conditions.append("(" + " OR ".join(casts) + ")" if casts else "1=0")
+        if custom_where:
+            conditions.append(f"({custom_where})")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
         selected = sort_column or next((column.name for column in columns if column.primary_key), names[0] if names else "")
-        order = f" ORDER BY {self.quote(selected)} {'DESC' if descending else 'ASC'}" if selected else ""
+        order = f" ORDER BY {custom_order}" if custom_order else (f" ORDER BY {self.quote(selected)} {'DESC' if descending else 'ASC'}" if selected else "")
         with self.session() as db:
-            total = self._query(db, f"SELECT COUNT(*) AS count_rows FROM {self.table_sql(table)}{where}", values).rows[0]
-            count = next(iter(total.values()))
+            count = None
+            if self.kind == "MySQL" and not where:
+                # InnoDB COUNT(*) scans the complete table. On large remote
+                # tables that can exceed the socket timeout before the first
+                # page is even read. TABLE_ROWS is the same estimate already
+                # used by the sidebar catalog and returns immediately.
+                estimate = self._query(
+                    db,
+                    "SELECT TABLE_ROWS AS count_rows FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                    (self.connection.database or "", table.split(".")[-1]),
+                ).rows
+                if estimate and estimate[0].get("count_rows") is not None:
+                    count = int(estimate[0]["count_rows"])
+            if count is None:
+                total = self._query(db, f"SELECT COUNT(*) AS count_rows FROM {self.table_sql(table)}{where}", values).rows[0]
+                count = next(iter(total.values()))
             binds = self.binds(2, len(values))
             if self.kind == "Oracle":
                 suffix = f" OFFSET {binds[0]} ROWS FETCH NEXT {binds[1]} ROWS ONLY"
@@ -358,6 +401,66 @@ class SQLAdapter:
             result = self._query(db, f"SELECT * FROM {self.table_sql(table)}{where}{order}{suffix}", values + pagination)
             result.total = int(count)
             return result
+
+    def apply_grid_changes(self, table, *, updates=(), inserts=(), deletes=()):
+        """Apply staged SQL grid edits atomically in one database transaction."""
+        require_writable(self.connection)
+        columns = self.get_schema(table)
+        names = {column.name for column in columns}
+        primary_key = {column.name for column in columns if column.primary_key}
+        if not primary_key:
+            raise ValueError("Grid editing requires a primary key.")
+        updates, inserts, deletes = list(updates or ()), list(inserts or ()), list(deletes or ())
+
+        def validate_keys(keys):
+            if set(keys) != primary_key or any(keys.get(name) is None for name in primary_key):
+                raise ValueError("Provide every primary key column, and only primary key columns.")
+
+        for keys, values in updates:
+            validate_keys(keys)
+            if not values or not set(values) <= names or set(values) & primary_key:
+                raise ValueError("Updates must contain non-primary-key columns from the table.")
+        for values in inserts:
+            if not set(values) <= names:
+                raise ValueError("Unknown column in inserted row.")
+        for keys in deletes:
+            validate_keys(keys)
+
+        affected = 0
+        with self.session() as db:
+            for keys, values in updates:
+                assignments = list(values)
+                binds = self.binds(len(assignments) + len(primary_key))
+                query = f"UPDATE {self.table_sql(table)} SET " + ", ".join(
+                    f"{self.quote(name)}={binds[index]}" for index, name in enumerate(assignments)
+                )
+                query += " WHERE " + " AND ".join(
+                    f"{self.quote(name)}={binds[index + len(assignments)]}" for index, name in enumerate(primary_key)
+                )
+                result = self._query(db, query, tuple(values[name] for name in assignments) + tuple(keys[name] for name in primary_key))
+                if result.affected != 1:
+                    raise ValueError("A staged row changed or was deleted. Refresh before committing.")
+                affected += result.affected
+            for values in inserts:
+                names_in_row = list(values)
+                if not names_in_row:
+                    query, parameters = f"INSERT INTO {self.table_sql(table)} DEFAULT VALUES", ()
+                    if self.kind == "MySQL":
+                        query = f"INSERT INTO {self.table_sql(table)} () VALUES ()"
+                else:
+                    query = f"INSERT INTO {self.table_sql(table)} ({', '.join(self.quote(name) for name in names_in_row)}) VALUES ({', '.join(self.binds(len(names_in_row)))})"
+                    parameters = tuple(values[name] for name in names_in_row)
+                affected += self._query(db, query, parameters).affected
+            for keys in deletes:
+                binds = self.binds(len(primary_key))
+                query = f"DELETE FROM {self.table_sql(table)} WHERE " + " AND ".join(
+                    f"{self.quote(name)}={binds[index]}" for index, name in enumerate(primary_key)
+                )
+                result = self._query(db, query, tuple(keys[name] for name in primary_key))
+                if result.affected != 1:
+                    raise ValueError("A staged row changed or was deleted. Refresh before committing.")
+                affected += result.affected
+        return QueryResult(affected=affected)
 
     def _writable_schema(self, table, values=None, keys=None):
         require_writable(self.connection)
@@ -460,7 +563,8 @@ class MongoAdapter:
                            "ObjectId" if name == "_id" else type(next((document[name] for document in documents if name in document), "")).__name__,
                            name == "_id", name != "_id") for name in names]
 
-    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False):
+    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by=""):
         page, page_size = max(1, int(page)), max(1, min(MAX_ROWS, int(page_size)))
         query = {}
         if search:
@@ -918,7 +1022,43 @@ class RedisAdapter:
             raise ValueError("This Redis key changed concurrently. Refresh before saving again.") from None
         return QueryResult(affected=1)
 
-    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False):
+    def set_key_ttl(self, key, seconds, *, expected_ttl_ms=None):
+        """Set or remove one key's expiry without changing its value."""
+        require_writable(self.connection)
+        if not isinstance(key, (str, bytes)):
+            raise ValueError("A Redis key must be a string or bytes.")
+        if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0):
+            raise ValueError("TTL must be a positive number of seconds or no expiry.")
+        if expected_ttl_ms is not None and (
+                isinstance(expected_ttl_ms, bool) or not isinstance(expected_ttl_ms, int)):
+            raise ValueError("The original TTL is invalid. Refresh before changing the expiry.")
+        watch_error = driver("redis").WatchError
+        try:
+            with self.session() as client, client.pipeline(transaction=True) as transaction:
+                transaction.watch(key)
+                kind = _redis_kind(transaction.type(key))
+                current_ttl = int(transaction.pttl(key))
+                if kind == "none" or current_ttl == -2:
+                    raise ValueError("This Redis key is missing or expired. Refresh before changing the expiry.")
+                if expected_ttl_ms is not None:
+                    current_persistent = current_ttl == -1
+                    expected_persistent = expected_ttl_ms == -1
+                    if current_persistent != expected_persistent:
+                        raise ValueError("This Redis key expiry changed. Refresh before changing the expiry.")
+                transaction.multi()
+                if seconds is None:
+                    transaction.persist(key)
+                else:
+                    transaction.expire(key, seconds)
+                result = transaction.execute()
+                if not result or not int(result[0]):
+                    raise ValueError("This Redis key expired while changing the expiry. Refresh and try again.")
+        except watch_error:
+            raise ValueError("This Redis key changed concurrently. Refresh before changing the expiry.") from None
+        return QueryResult(affected=1)
+
+    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by=""):
         with self.session() as client:
             kind = _redis_kind(client.type(table))
             if kind == "none":
@@ -1119,11 +1259,19 @@ class SSHAdapter:
     def mutate_entry(self, key, kind, action, payload):
         return self._run("mutate_entry", key, kind, action, payload)
 
+    def set_key_ttl(self, key, seconds, *, expected_ttl_ms=None):
+        return self._run("set_key_ttl", key, seconds, expected_ttl_ms=expected_ttl_ms)
+
     def get_schema(self, table):
         return self._run("get_schema", table)
 
-    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False):
-        return self._run("fetch_rows", table, page, page_size, search, sort_column, descending)
+    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by=""):
+        return self._run("fetch_rows", table, page, page_size, search, sort_column, descending,
+                         where_clause, order_by)
+
+    def apply_grid_changes(self, table, *, updates=(), inserts=(), deletes=()):
+        return self._run("apply_grid_changes", table, updates=updates, inserts=inserts, deletes=deletes)
 
     def execute(self, query):
         return self._run("execute", query)

@@ -22,6 +22,14 @@ class WorkspaceTab:
     sort_column: str = ''
     descending: bool = False
     search: str = ''
+    where_clause: str = ''
+    order_by: str = ''
+    where_draft: str = ''
+    order_by_draft: str = ''
+    pending_updates: dict = field(default_factory=dict)
+    pending_inserts: list = field(default_factory=list)
+    pending_deletes: list = field(default_factory=list)
+    grid_committing: bool = False
     query_text: str = ''
     query_cursor: tuple = (0, 0)
     query_running: bool = False

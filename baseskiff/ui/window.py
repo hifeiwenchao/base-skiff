@@ -234,6 +234,9 @@ class MainWindow(QMainWindow):
         self.query_result = QueryResult()
         self.sort_column = ''
         self.descending = False
+        self.where_clause = ''
+        self.order_by = ''
+        self._grid_updating = False
         self._tasks = []
         self._pending = 0
         self._generation = 0
@@ -247,6 +250,7 @@ class MainWindow(QMainWindow):
         self._tree_search_text = ''
         self._tree_active_key = None
         self._redis_key_searches = {}
+        self._redis_applied_searches = {}
         self._redis_key_pages = {}
         self._redis_key_page_searches = {}
         self._redis_filtered_results = set()
@@ -342,28 +346,22 @@ class MainWindow(QMainWindow):
         self.redis_key_search.setClearButtonEnabled(True)
         self.redis_key_search.setMinimumWidth(0)
         self.redis_key_search.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.redis_key_search.addAction(icon('search', '#93a18f', 15), QLineEdit.ActionPosition.LeadingPosition)
-        redis_search_layout.addWidget(self.redis_key_search)
-        search_options = QHBoxLayout()
-        search_options.setSpacing(2)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(4)
+        search_row.addWidget(self.redis_key_search, 1)
+        self.redis_key_search_button = button('', 'search', self._search_redis_keys, 'redisKeySearchSubmit')
+        search_row.addWidget(self.redis_key_search_button)
+        redis_search_layout.addLayout(search_row)
         self.redis_key_mode = RedisSearchModeCombo(objectName='redisKeySearchMode')
         self.redis_key_mode.setMinimumWidth(65)
         self.redis_key_mode.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.redis_key_mode.popup_closed.connect(self._queue_tree_rebuild)
         for mode in REDIS_KEY_SEARCH_MODES:
             self.redis_key_mode.addItem(mode, mode)
-        search_options.addWidget(self.redis_key_mode, 1)
-        self.redis_key_refresh = button('', 'refresh', self._search_redis_keys, 'iconButton')
-        self.redis_key_refresh.setFixedSize(22, 24)
-        search_options.addWidget(self.redis_key_refresh)
-        redis_search_layout.addLayout(search_options)
+        redis_search_layout.addWidget(self.redis_key_mode)
         self.redis_key_status = label('', 'muted')
         self.redis_key_status.setWordWrap(True)
         redis_search_layout.addWidget(self.redis_key_status)
-        self.redis_key_timer = QTimer(self)
-        self.redis_key_timer.setSingleShot(True)
-        self.redis_key_timer.setInterval(350)
-        self.redis_key_timer.timeout.connect(self._search_redis_keys)
         self.redis_key_search.textChanged.connect(self._redis_search_changed)
         self.redis_key_search.returnPressed.connect(self._search_redis_keys)
         self.redis_key_mode.currentIndexChanged.connect(self._redis_search_changed)
@@ -526,6 +524,30 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         tab_layout = layout(tab)
         tab_layout.setContentsMargins(24, 0, 24, 0)
+        criteria = QWidget(objectName='tableCriteriaBar')
+        criteria_layout = layout(criteria, 0, 8, True)
+        criteria_layout.setContentsMargins(0, 12, 0, 0)
+        self.where_label = label('WHERE', 'criteriaLabel')
+        criteria_layout.addWidget(self.where_label)
+        self.where_edit = QLineEdit(objectName='tableWhere')
+        self.where_edit.setClearButtonEnabled(True)
+        self.where_edit.setPlaceholderText('id = 1')
+        self.where_edit.returnPressed.connect(self.apply_table_query)
+        criteria_layout.addWidget(self.where_edit, 2)
+        self.order_by_label = label('ORDER BY', 'criteriaLabel')
+        criteria_layout.addWidget(self.order_by_label)
+        self.order_by_edit = QLineEdit(objectName='tableOrderBy')
+        self.order_by_edit.setClearButtonEnabled(True)
+        self.order_by_edit.setPlaceholderText('id DESC')
+        self.order_by_edit.returnPressed.connect(self.apply_table_query)
+        criteria_layout.addWidget(self.order_by_edit, 2)
+        self.apply_table_query_button = button('', 'search', self.apply_table_query, 'secondaryButton')
+        self.apply_table_query_button.setObjectName('applyTableQuery')
+        criteria_layout.addWidget(self.apply_table_query_button)
+        self.clear_table_query_button = button('', 'close', self.clear_table_query, 'iconButton')
+        self.clear_table_query_button.setObjectName('clearTableQuery')
+        criteria_layout.addWidget(self.clear_table_query_button)
+        tab_layout.addWidget(criteria)
         toolbar = QWidget()
         toolbar_layout = layout(toolbar, 0, 8, True)
         toolbar_layout.setContentsMargins(0, 17, 0, 17)
@@ -557,9 +579,19 @@ class MainWindow(QMainWindow):
         self.add_row_button = button('', 'plus', self.add_row, 'primaryButton')
         self.add_row_button.setMinimumWidth(110)
         toolbar_layout.addWidget(self.add_row_button)
+        self.revert_table_button = button('', 'undo', self.revert_table_changes, 'secondaryButton')
+        self.revert_table_button.setObjectName('revertTableChanges')
+        self.commit_table_button = button('', 'check', self.commit_table_changes, 'primaryButton')
+        self.commit_table_button.setObjectName('commitTableChanges')
+        toolbar_layout.addWidget(self.revert_table_button)
+        toolbar_layout.addWidget(self.commit_table_button)
         tab_layout.addWidget(toolbar)
         self.data_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.data_table = self._make_table()
+        self.data_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                        | QAbstractItemView.EditTrigger.SelectedClicked
+                                        | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.data_table.itemChanged.connect(self._grid_item_changed)
         self.data_table.itemSelectionChanged.connect(self.selection_changed)
         self.data_table.horizontalHeader().sectionClicked.connect(self.sort_rows)
         self.data_splitter.addWidget(self.data_table)
@@ -580,6 +612,7 @@ class MainWindow(QMainWindow):
         self.redis_view = RedisValueWidget(language=self.language)
         self.redis_view.refresh_requested.connect(self.refresh_data)
         self.redis_view.mutation_requested.connect(self._mutate_redis_entry)
+        self.redis_view.ttl_requested.connect(self._set_redis_ttl)
         self.data_views.addWidget(self.redis_view)
         tab_layout.addWidget(self.data_views, 1)
         pager = QWidget()
@@ -746,7 +779,8 @@ class MainWindow(QMainWindow):
         self.redis_key_search.setPlaceholderText(self.t('搜索 Redis key…', 'Search Redis keys…'))
         self.redis_key_mode.setToolTip(self.t('字面前缀匹配 · 精确匹配完整键名',
                                             'Literal prefix · Exact full key'))
-        self.redis_key_refresh.setToolTip(self.t('重新搜索键', 'Reload keys'))
+        self.redis_key_search_button.setToolTip(self.t('搜索（Enter）', 'Search (Enter)'))
+        self.redis_key_search_button.setAccessibleName(self.t('搜索', 'Search'))
         self.tip_title.setText(self.t('为专注而设计', 'A little more flow'))
         self.tip_text.setText(self.t('⌘ / Ctrl + Enter 运行查询\n⌘ / Ctrl + K 快速查找连接', '⌘ / Ctrl + Enter to run a query\n⌘ / Ctrl + K to find a connection'))
         self.local_label.setText(self.t('本地工作空间', 'Local workspace'))
@@ -754,6 +788,15 @@ class MainWindow(QMainWindow):
         self.language_button.setToolTip(self.t('Switch to English', '切换为中文'))
         self.help_button.setToolTip(self.t('使用帮助', 'Help & shortcuts'))
         self.data_search.setPlaceholderText(self.t('筛选当前数据表…', 'Filter table records…'))
+        self.where_label.setText(self.t('WHERE', 'WHERE'))
+        self.order_by_label.setText(self.t('ORDER BY', 'ORDER BY'))
+        self.where_edit.setPlaceholderText(self.t('例如：status = \'Active\'', "e.g. status = 'Active'"))
+        self.order_by_edit.setPlaceholderText(self.t('例如：created_at DESC', 'e.g. created_at DESC'))
+        self.apply_table_query_button.setText(self.t('查询', 'Apply'))
+        self.apply_table_query_button.setToolTip(self.t('执行 WHERE / ORDER BY', 'Apply WHERE / ORDER BY'))
+        self.clear_table_query_button.setToolTip(self.t('清空 WHERE / ORDER BY', 'Clear WHERE / ORDER BY'))
+        self.revert_table_button.setText(self.t('撤销修改', 'Revert'))
+        self.commit_table_button.setText(self.t('提交', 'Commit'))
         self.refresh_button.setToolTip(self.t('刷新', 'Refresh'))
         self.delete_row_button.setToolTip(self.t('删除选中记录', 'Delete selected records'))
         self.edit_row_button.setToolTip(self.t('编辑选中记录', 'Edit selected record'))
@@ -1187,7 +1230,7 @@ class MainWindow(QMainWindow):
             for item in (root, *iter_items(root)):
                 item.setExpanded(self._tree_expansion.get(item.data(0, NODE_ID_ROLE), False))
                 scope = item.data(0, SCOPE_ROLE)
-                if item.data(0, NODE_KIND_ROLE) == 'redis_folder' and self._redis_key_searches.get(scope, ('', 'prefix'))[0]:
+                if item.data(0, NODE_KIND_ROLE) == 'redis_folder' and self._redis_applied_searches.get(scope, ('', 'prefix'))[0]:
                     item.setExpanded(True)
         self._tree_active_key = active_key
         self.tree.blockSignals(False)
@@ -1199,9 +1242,12 @@ class MainWindow(QMainWindow):
                 self._sync_redis_search()
                 self._mount_redis_search(database)
                 break
-        if not reveal_active:
-            self.tree.horizontalScrollBar().setValue(scroll[0])
-            self.tree.verticalScrollBar().setValue(scroll[1])
+        # Selecting a different key may reveal its ancestors, but must not
+        # reset the user's viewport. Settle the new rows/search host before
+        # restoring the bars so Qt cannot clamp them to a temporary range.
+        self.tree.doItemsLayout()
+        self.tree.horizontalScrollBar().setValue(scroll[0])
+        self.tree.verticalScrollBar().setValue(scroll[1])
         owner, focused, position, anchor = search_focus
         if owner == self._redis_search_owner and focused is not None and self.redis_search_group.isVisible():
             if focused is self.redis_key_search:
@@ -1215,7 +1261,7 @@ class MainWindow(QMainWindow):
                 continue
             scope = item.data(0, SCOPE_ROLE)
             if kind == 'redis_folder' and (scope in self._redis_filtered_results or
-                                          self._redis_key_searches.get(scope, ('', 'prefix'))[0]):
+                                          self._redis_applied_searches.get(scope, ('', 'prefix'))[0]):
                 continue
             self._tree_expansion[identity] = item.isExpanded()
 
@@ -1343,8 +1389,6 @@ class MainWindow(QMainWindow):
         if mode not in REDIS_KEY_SEARCH_MODES:
             mode = 'prefix'
             self._redis_key_searches[scope] = (text, mode)
-            self._redis_key_pages.pop(scope, None)
-            self._redis_key_page_searches.pop(scope, None)
         return text, mode
 
     def _sync_redis_search(self):
@@ -1358,7 +1402,6 @@ class MainWindow(QMainWindow):
         owner = self._redis_scope(connection)
         text, mode = self._redis_search_state(owner)
         if owner != self._redis_search_owner or self.redis_key_mode.currentData() != mode:
-            self.redis_key_timer.stop()
             self._redis_search_owner = owner
             self.redis_key_search.blockSignals(True)
             self.redis_key_mode.blockSignals(True)
@@ -1370,14 +1413,14 @@ class MainWindow(QMainWindow):
         self.redis_key_heading.setText(self.t(f'DB{database} 中的键', f'Keys in DB{database}'))
         self.redis_key_search.setPlaceholderText(self.t(f'搜索 DB{database} 中的键…', f'Search keys in DB{database}…'))
         status, message = self._redis_key_statuses.get(owner, ('', ''))
-        if status == 'loading':
+        if (text, mode) != self._redis_applied_searches.get(owner, ('', 'prefix')):
+            text = self.t('按回车或点击搜索', 'Press Enter or click Search')
+        elif status == 'loading':
             text = self.t('正在搜索…', 'Searching…')
         elif status == 'loading_more':
             count = len(self._redis_key_pages[owner].keys)
             text = self.t(f'已加载 {count:,} 个键 · 正在载入下一批（最多 {MAX_REDIS_KEYS:,} 个）…',
                           f'{count:,} keys loaded · Loading up to {MAX_REDIS_KEYS:,} more…')
-        elif status == 'waiting':
-            text = self.t('等待搜索…', 'Waiting to search…')
         elif status == 'failed':
             text = self.t('搜索失败：', 'Search failed: ') + message
         else:
@@ -1394,16 +1437,11 @@ class MainWindow(QMainWindow):
         scope = self._redis_scope(connection)
         if self._redis_search_owner != scope:
             return
-        if not self._redis_key_searches.get(scope, ('', 'prefix'))[0] and self.redis_key_search.text():
-            self._capture_tree_expansion()
-        self._redis_key_request += 1
-        self._redis_search_tokens[scope] = object()
+        # Draft edits are local. Keep the submitted scan and its results valid
+        # until Search / Enter explicitly applies the new text and mode.
         self._redis_key_searches[scope] = (self.redis_key_search.text(), self.redis_key_mode.currentData())
-        self._redis_search_dirty.add(scope)
-        self._redis_key_page_searches.pop(scope, None)
-        self._redis_key_statuses[scope] = ('waiting', '')
-        self.redis_key_status.setText(self.t('等待搜索…', 'Waiting to search…'))
-        self.redis_key_timer.start()
+        self._sync_redis_search()
+        self._update_redis_load_more(scope)
 
     def _cache_redis_key_page(self, scope, page, text, mode, *, append=False):
         # Merge by the original key, never its shortened or escaped label.
@@ -1423,13 +1461,24 @@ class MainWindow(QMainWindow):
         self._sync_redis_search()
 
     def _search_redis_keys(self, *_args):
-        self.redis_key_timer.stop()
         connection = self.current_connection
         if not connection or connection.kind != 'Redis':
             return
         scope = self._redis_scope(connection)
         if self._redis_search_owner == scope:
             self._redis_key_searches[scope] = (self.redis_key_search.text(), self.redis_key_mode.currentData())
+        text, mode = self._redis_search_state(scope)
+        if not self._redis_applied_searches.get(scope, ('', 'prefix'))[0] and text:
+            self._capture_tree_expansion()
+        self._redis_applied_searches[scope] = (text, mode)
+        self._refresh_redis_keys()
+
+    def _refresh_redis_keys(self):
+        """Reload the submitted filter without applying an unfinished draft."""
+        connection = self.current_connection
+        if not connection or connection.kind != 'Redis':
+            return
+        scope = self._redis_scope(connection)
         self._redis_search_dirty.add(scope)
         self._request_redis_keys(connection)
 
@@ -1437,8 +1486,9 @@ class MainWindow(QMainWindow):
         page = self._redis_key_pages.get(scope)
         return (page is not None and getattr(page, 'continuation', None) is not None
                 and scope not in self._redis_search_dirty
-                and self._redis_key_page_searches.get(scope) == self._redis_search_state(scope)
-                and self._redis_key_statuses.get(scope, ('', ''))[0] not in {'loading', 'loading_more', 'waiting'})
+                and self._redis_key_page_searches.get(scope) == self._redis_applied_searches.get(scope, ('', 'prefix'))
+                and self._redis_search_state(scope) == self._redis_applied_searches.get(scope, ('', 'prefix'))
+                and self._redis_key_statuses.get(scope, ('', ''))[0] not in {'loading', 'loading_more'})
 
     def _configure_redis_load_more(self, item, scope):
         loading = self._redis_key_statuses.get(scope, ('', ''))[0] == 'loading_more'
@@ -1467,7 +1517,7 @@ class MainWindow(QMainWindow):
 
     def _request_redis_keys(self, connection, *, append=False):
         scope = self._redis_scope(connection)
-        text, mode = self._redis_search_state(scope)
+        text, mode = self._redis_applied_searches.get(scope, ('', 'prefix'))
         if append and not self._can_append_redis_keys(scope):
             return
         if (self._redis_key_statuses.get(scope, ('', ''))[0] in {'loading', 'loading_more'} and
@@ -1489,7 +1539,7 @@ class MainWindow(QMainWindow):
         def current():
             return (self._redis_search_tokens.get(scope) is token and
                     scope not in self._redis_search_dirty and
-                    self._redis_search_state(scope) == (text, mode) and
+                    self._redis_applied_searches.get(scope, ('', 'prefix')) == (text, mode) and
                     any(c.id == connection.id for c in self.connections))
         def loaded(page):
             if current():
@@ -1545,22 +1595,20 @@ class MainWindow(QMainWindow):
             table.verticalScrollBar().setValue(y)
 
     def _capture_workspace(self):
-        if self.redis_key_timer.isActive() and self.current_connection and self.current_connection.kind == 'Redis':
-            self._redis_search_dirty.add(self._redis_scope(self.current_connection))
         state = self._active_workspace
         if state is None or state.closed:
             self.search_timer.stop()
-            self.redis_key_timer.stop()
             return
         if self.search_timer.isActive():
             state.dirty = True
             self.page = 1
         self.search_timer.stop()
-        self.redis_key_timer.stop()
         for name in ('page', 'page_size', 'total_rows', 'columns', 'current_result',
                      'query_result', 'sort_column', 'descending'):
             setattr(state, name, getattr(self, name))
         state.search = self.data_search.text()
+        state.where_draft = self.where_edit.text()
+        state.order_by_draft = self.order_by_edit.text()
         state.query_text = self.query_editor.toPlainText()
         cursor = self.query_editor.textCursor()
         state.query_cursor = cursor.position(), cursor.anchor()
@@ -1599,7 +1647,36 @@ class MainWindow(QMainWindow):
             return
         state = self._workspace_tabs.get(self.table_tabs.tabData(index))
         if state is not None and state is not self._active_workspace:
+            if self._pending_grid_count_for(state) and not self._confirm_pending_grid(state):
+                current = self._tab_index(self._active_workspace.identity) if self._active_workspace else -1
+                self.table_tabs.blockSignals(True)
+                self.table_tabs.setCurrentIndex(current)
+                self.table_tabs.blockSignals(False)
+                return
             self._activate_workspace(state)
+
+    @staticmethod
+    def _pending_grid_count_for(state):
+        if state is None or state.closed:
+            return 0
+        return len(state.pending_updates) + len(state.pending_inserts) + len(state.pending_deletes)
+
+    def _confirm_pending_grid(self, state):
+        if not self._pending_grid_count_for(state):
+            return True
+        answer = QMessageBox.warning(
+            self,
+            self.t('有未提交修改', 'Unsaved table changes'),
+            self.t('当前表格有未提交修改，是否放弃这些修改？', 'This table has uncommitted changes. Discard them?'),
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Discard:
+            return False
+        state.pending_updates.clear()
+        state.pending_inserts.clear()
+        state.pending_deletes.clear()
+        return True
 
     def _tab_index(self, identity):
         return next((i for i in range(self.table_tabs.count())
@@ -1627,11 +1704,29 @@ class MainWindow(QMainWindow):
                       if self.table_tabs.tabData(i) != identity]
             for other in others:
                 self.close_table_tab(self._tab_index(other))
+        def close_all():
+            if target_index() >= 0:
+                self.close_all_table_tabs()
         menu = QMenu(self)
         menu.addAction(self.t('关闭当前标签页', 'Close tab'), close_current)
         action = menu.addAction(self.t('关闭其他标签页', 'Close other tabs'), close_others)
         action.setEnabled(self.table_tabs.count() > 1)
+        menu.addAction(self.t('关闭所有标签页', 'Close all tabs'), close_all)
         menu.exec(self.table_tabs.mapToGlobal(point))
+
+    def close_all_table_tabs(self):
+        if not self.table_tabs.count():
+            return
+        if any(not self._confirm_pending_grid(state) for state in self._workspace_tabs.values()):
+            return
+        self._capture_workspace()
+        for state in self._workspace_tabs.values():
+            state.close()
+        self._workspace_tabs.clear()
+        with QSignalBlocker(self.table_tabs):
+            while self.table_tabs.count():
+                self.table_tabs.removeTab(self.table_tabs.count() - 1)
+        self._clear_workspace(self.current_connection)
 
     def _update_table_tab_labels(self):
         for index in range(self.table_tabs.count()):
@@ -1670,9 +1765,12 @@ class MainWindow(QMainWindow):
         for name in ('page', 'page_size', 'total_rows', 'columns', 'current_result',
                      'query_result', 'sort_column', 'descending'):
             setattr(self, name, getattr(state, name))
+        self.where_clause, self.order_by = state.where_clause, state.order_by
         self._query_running, self._query_state, self._query_error = state.query_running, state.query_state, state.query_error
         self._redis_snapshot = state.redis_snapshot
         for widget, value, setter in ((self.data_search, state.search, 'setText'),
+                                      (self.where_edit, state.where_draft, 'setText'),
+                                      (self.order_by_edit, state.order_by_draft, 'setText'),
                                       (self.page_size_combo, str(state.page_size), 'setCurrentText'),
                                       (self.query_editor, state.query_text, 'setPlainText')):
             widget.blockSignals(True)
@@ -1727,13 +1825,16 @@ class MainWindow(QMainWindow):
         scope = self._redis_scope(state.connection)
         if scope in self._redis_search_dirty:
             self._redis_search_dirty.discard(scope)
-            self._search_redis_keys()
+            self._refresh_redis_keys()
 
     def close_table_tab(self, index):
         if not 0 <= index < self.table_tabs.count():
             return
         identity = self.table_tabs.tabData(index)
         state = self._workspace_tabs.pop(identity, None)
+        if state is not None and not self._confirm_pending_grid(state):
+            self._workspace_tabs[identity] = state
+            return
         active = self._workspace_is_active(state)
         if active:
             self._capture_workspace()
@@ -1752,7 +1853,6 @@ class MainWindow(QMainWindow):
 
     def _clear_workspace(self, connection=None):
         self.search_timer.stop()
-        self.redis_key_timer.stop()
         self._generation += 1
         self._redis_key_request += 1
         self._active_workspace = None
@@ -1762,12 +1862,19 @@ class MainWindow(QMainWindow):
         self.current_result, self.query_result = QueryResult(), QueryResult()
         self.page, self.total_rows = 1, 0
         self.sort_column, self.descending = '', False
+        self.where_clause, self.order_by = '', ''
         self._query_running, self._query_state, self._query_error = False, '', ''
         self._redis_snapshot = None
         self.redis_view.clear()
         self.data_search.blockSignals(True)
         self.data_search.clear()
         self.data_search.blockSignals(False)
+        self.where_edit.blockSignals(True)
+        self.order_by_edit.blockSignals(True)
+        self.where_edit.clear()
+        self.order_by_edit.clear()
+        self.where_edit.blockSignals(False)
+        self.order_by_edit.blockSignals(False)
         self.query_editor.clear()
         self.populate_table(self.data_table, self.current_result)
         self.populate_table(self.query_result_table, self.query_result)
@@ -1838,11 +1945,14 @@ class MainWindow(QMainWindow):
         self._load_table_schema(state)
         self.refresh_data()
 
-    def refresh_data(self):
+    def refresh_data(self, *, force=False):
         if not self.current_connection or not self.current_table:
             return
         state = self._workspace_state()
         if state.missing:
+            return
+        if (not force and self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
+                and self._pending_grid_count()):
             return
         state.dirty = False
         if self.current_connection.kind == 'Redis':
@@ -1854,11 +1964,20 @@ class MainWindow(QMainWindow):
         connection, table = state.connection, state.table
         page, page_size = state.page, state.page_size
         search, sort_column, descending = state.search, state.sort_column, state.descending
+        where_clause, order_by = state.where_clause, state.order_by
         request = state.request('rows')
         self._rows_request += 1
         def loaded(result):
             if not state.accepts('rows', request):
                 return
+            if self._pending_grid_count_for(state):
+                deleted = {self._grid_key(item, state.columns) for item in state.pending_deletes}
+                updates = {key: record['values'] for key, record in state.pending_updates.items()}
+                result.rows = [row for row in result.rows if self._grid_key(row, state.columns) not in deleted]
+                for row in result.rows:
+                    values = updates.get(self._grid_key(row, state.columns), {})
+                    row.update(values)
+                result.total = max(0, result.total - len(deleted) + len(state.pending_inserts))
             state.current_result, state.total_rows, state.error = result, result.total, ''
             last_page = max(1, math.ceil(result.total / page_size))
             if state.page > last_page:
@@ -1875,7 +1994,8 @@ class MainWindow(QMainWindow):
                 self.footer_detail.setText(f'{result.elapsed_ms:.1f} ms  ·  {connection.kind}  ·  BaseSkiff 0.1.0')
                 self.selection_changed()
         self.submit(partial(self.service.fetch_rows, connection.id, table, page=page, page_size=page_size,
-                            search=search, sort_column=sort_column, descending=descending), loaded,
+                            search=search, sort_column=sort_column, descending=descending,
+                            where_clause=where_clause, order_by=order_by), loaded,
                     lambda message: self._workspace_error(state, 'rows', request, message))
 
     def _refresh_redis_value(self, state=None):
@@ -1935,7 +2055,7 @@ class MainWindow(QMainWindow):
             if active:
                 self.footer_detail.setText(self.t('已保存 Redis 数据', 'Redis value saved'))
                 self.refresh_data()
-                self._search_redis_keys()
+                self._refresh_redis_keys()
         def failed(message):
             active = finish()
             if state.closed:
@@ -1947,49 +2067,127 @@ class MainWindow(QMainWindow):
                     self.show_error(message)
         self.submit(self._connection_operation('mutate_redis_entry', connection, key, snapshot.kind, action, dict(payload)), done, failed)
 
+    def _set_redis_ttl(self, seconds):
+        connection, snapshot = self.current_connection, self._redis_snapshot
+        identity = (*self._redis_scope(connection), snapshot.key) if connection and connection.kind == 'Redis' and snapshot else None
+        if (not connection or connection.kind != 'Redis' or connection.read_only or not snapshot
+                or snapshot.key != self.current_table or identity in self._redis_writes):
+            return
+        state = self._workspace_state()
+        key, expected_ttl_ms = snapshot.key, snapshot.ttl_ms
+        token = object()
+        self._redis_writes[identity] = token
+        self.redis_view.set_busy(True)
+
+        def finish():
+            if self._redis_writes.get(identity) is token:
+                self._redis_writes.pop(identity)
+            return not state.closed and self._workspace_is_active(state)
+
+        def done(_result):
+            active = finish()
+            target = self._workspace_tabs.get(identity, state)
+            if not target.closed:
+                target.dirty = True
+            active = active or self._workspace_is_active(target)
+            if active:
+                self.footer_detail.setText(self.t('TTL 已更新', 'TTL updated'))
+                self.refresh_data()
+
+        def failed(message):
+            active = finish()
+            if state.closed:
+                return
+            state.error = message
+            if active:
+                self.redis_view.set_busy(False)
+                self.show_error(message)
+
+        self.submit(self._connection_operation(
+            'set_redis_ttl', connection, key, seconds,
+            expected_ttl_ms=expected_ttl_ms,
+        ), done, failed)
+
     def populate_table(self, table, result, offset=0):
+        self._grid_updating = True
         table.setUpdatesEnabled(False)
-        table.clear()
-        table.setColumnCount(len(result.columns))
-        table.setRowCount(len(result.rows))
-        table.setHorizontalHeaderLabels(result.columns)
-        table.setVerticalHeaderLabels([str(offset + i + 1) for i in range(len(result.rows))])
-        mono = QFont('Menlo' if sys.platform == 'darwin' else 'Consolas', 11)
-        mono.setPixelSize(12)
-        for i, row in enumerate(result.rows):
+        try:
+            table.clear()
+            table.setColumnCount(len(result.columns))
+            table.setRowCount(len(result.rows))
+            table.setHorizontalHeaderLabels(result.columns)
+            table.setVerticalHeaderLabels([str(offset + i + 1) for i in range(len(result.rows))])
+            mono = QFont('Menlo' if sys.platform == 'darwin' else 'Consolas', 11)
+            mono.setPixelSize(12)
+            editable_sql = bool(table is self.data_table and self.current_connection
+                                and self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
+                                and not self.current_connection.read_only
+                                and any(column.primary_key for column in self.columns))
+            primary_keys = {column.name for column in self.columns if column.primary_key}
+            for i, row in enumerate(result.rows):
+                for j, column in enumerate(result.columns):
+                    value = row.get(column)
+                    text = display_value(value)
+                    item = QTableWidgetItem(text)
+                    item.setToolTip(text)
+                    item.setData(Qt.ItemDataRole.UserRole, value)
+                    if editable_sql:
+                        if column in primary_keys:
+                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        else:
+                            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                    if value is None:
+                        item.setForeground(QColor('#b6beb0'))
+                        font = QFont(mono)
+                        font.setItalic(True)
+                        item.setFont(font)
+                    elif column in ('id', 'email', 'created_at', 'updated_at') or isinstance(value, (int, float)):
+                        item.setFont(mono)
+                        item.setForeground(QColor('#8e9b83' if column == 'id' else '#6c7c62'))
+                    if isinstance(value, (int, float)):
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    table.setItem(i, j, item)
             for j, column in enumerate(result.columns):
-                value = row.get(column)
-                text = display_value(value)
-                item = QTableWidgetItem(text)
-                item.setToolTip(text)
-                item.setData(Qt.ItemDataRole.UserRole, value)
-                if value is None:
-                    item.setForeground(QColor('#b6beb0'))
-                    font = QFont(mono)
-                    font.setItalic(True)
-                    item.setFont(font)
-                elif column in ('id', 'email', 'created_at', 'updated_at') or isinstance(value, (int, float)):
-                    item.setFont(mono)
-                    item.setForeground(QColor('#8e9b83' if column == 'id' else '#6c7c62'))
-                if isinstance(value, (int, float)):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                table.setItem(i, j, item)
-        for j, column in enumerate(result.columns):
-            if column in ('id', '_id'):
-                table.setColumnWidth(j, 72 if column == 'id' else 220)
-            elif column == 'email':
-                table.setColumnWidth(j, 225)
-            elif column in ('status', 'plan', 'quantity', 'price'):
-                table.setColumnWidth(j, 105)
-            elif column in ('created_at', 'updated_at'):
-                table.setColumnWidth(j, 160)
-            else:
-                table.setColumnWidth(j, 155)
-        table.setUpdatesEnabled(True)
+                if column in ('id', '_id'):
+                    table.setColumnWidth(j, 72 if column == 'id' else 220)
+                elif column == 'email':
+                    table.setColumnWidth(j, 225)
+                elif column in ('status', 'plan', 'quantity', 'price'):
+                    table.setColumnWidth(j, 105)
+                elif column in ('created_at', 'updated_at'):
+                    table.setColumnWidth(j, 160)
+                else:
+                    table.setColumnWidth(j, 155)
+        finally:
+            table.setUpdatesEnabled(True)
+            self._grid_updating = False
 
     def _search_rows(self):
         self.page = 1
         self.refresh_data()
+
+    def apply_table_query(self):
+        connection = self.current_connection
+        if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} or not self.current_table:
+            return
+        state = self._workspace_state()
+        if state is None:
+            return
+        if self._pending_grid_count_for(state):
+            self.show_error(self.t('请先提交或撤销当前修改，再执行新的筛选。', 'Commit or revert the current edits before applying a new filter.'))
+            return
+        state.where_clause = self.where_edit.text().strip()
+        state.order_by = self.order_by_edit.text().strip()
+        state.where_draft = self.where_edit.text()
+        state.order_by_draft = self.order_by_edit.text()
+        self.where_clause, self.order_by = state.where_clause, state.order_by
+        state.page = self.page = 1
+        self.refresh_data()
+
+    def clear_table_query(self):
+        self.where_edit.clear()
+        self.order_by_edit.clear()
+        self.apply_table_query()
 
     def sort_rows(self, index):
         if index >= len(self.current_result.columns):
@@ -1997,6 +2195,14 @@ class MainWindow(QMainWindow):
         column = self.current_result.columns[index]
         self.descending = not self.descending if column == self.sort_column else False
         self.sort_column = column
+        if self.current_connection and self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            quote_char = '`' if self.current_connection.kind == 'MySQL' else '"'
+            quoted = quote_char + column.replace(quote_char, quote_char * 2) + quote_char
+            self.order_by_edit.setText(f"{quoted} {'DESC' if self.descending else 'ASC'}")
+            state = self._workspace_state()
+            if state:
+                state.order_by = self.order_by = self.order_by_edit.text()
+                state.order_by_draft = self.order_by_edit.text()
         self.data_table.horizontalHeader().setSortIndicator(index, Qt.SortOrder.DescendingOrder if self.descending else Qt.SortOrder.AscendingOrder)
         self.data_table.horizontalHeader().setSortIndicatorShown(True)
         self.refresh_data()
@@ -2025,6 +2231,13 @@ class MainWindow(QMainWindow):
         redis = bool(connection and connection.kind == 'Redis')
         self.data_views.setCurrentWidget(self.redis_view if redis else self.data_splitter)
         self.data_search.setVisible(not redis)
+        sql_table = bool(connection and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and self.current_table)
+        self.where_edit.setVisible(sql_table)
+        self.order_by_edit.setVisible(sql_table)
+        self.apply_table_query_button.setVisible(sql_table)
+        self.clear_table_query_button.setVisible(sql_table)
+        self.revert_table_button.setVisible(sql_table)
+        self.commit_table_button.setVisible(sql_table)
         self.data_pager.setVisible(not redis)
         self.edit_row_button.setVisible(not redis)
         self.refresh_button.setVisible(not redis)
@@ -2052,6 +2265,10 @@ class MainWindow(QMainWindow):
             self.table_subtitle.setText(self._active_workspace.error)
         writable = bool(connection and self.current_table and not missing and not connection.read_only and any(c.primary_key for c in self.columns))
         self.add_row_button.setEnabled(bool(connection and not connection.read_only) if redis else writable)
+        pending = self._pending_grid_count()
+        committing = bool(self._active_workspace and self._active_workspace.grid_committing)
+        self.commit_table_button.setEnabled(bool(sql_table and pending and writable and not committing))
+        self.revert_table_button.setEnabled(bool(sql_table and pending))
         self.run_button.setEnabled(connection is not None and not self._query_running)
         self.export_button.setEnabled(bool(self.current_result.columns))
         self.query_hint.setText(self.t('⌘ / Ctrl + Enter 执行 · 最多返回 1,000 行', '⌘ / Ctrl + Enter to run · Up to 1,000 rows'))
@@ -2060,6 +2277,12 @@ class MainWindow(QMainWindow):
         elif connection and connection.kind == 'Redis':
             self.query_hint.setText(self.t('Redis 命令，例如 GET key 或 SET key value', 'Redis commands, such as GET key or SET key value'))
         self.connection_actions.setEnabled(connection is not None)
+
+    def _pending_grid_count(self):
+        state = self._active_workspace
+        if state is None or state.closed:
+            return 0
+        return len(state.pending_updates) + len(state.pending_inserts) + len(state.pending_deletes)
 
     def render_schema(self):
         if not hasattr(self, 'schema_table'):
@@ -2072,6 +2295,131 @@ class MainWindow(QMainWindow):
 
     def _selected_rows(self):
         return sorted({index.row() for index in self.data_table.selectionModel().selectedRows()})
+
+    def _grid_key(self, row, columns=None):
+        columns = columns or self.columns
+        return tuple(row.get(column.name) for column in columns if column.primary_key)
+
+    @staticmethod
+    def _grid_value(column, text, original):
+        if original is not None and text == display_value(original):
+            return original
+        stripped = text.strip()
+        if column.nullable and stripped.upper() == 'NULL':
+            return None
+        kind = column.data_type.upper()
+        if original is None and not stripped and column.nullable:
+            return None
+        if isinstance(original, bool) or 'BOOL' in kind:
+            if stripped.lower() in {'true', '1', 'yes', 'on'}:
+                return True
+            if stripped.lower() in {'false', '0', 'no', 'off'}:
+                return False
+            raise ValueError('Enter true or false.')
+        if isinstance(original, int) or any(token in kind for token in ('INT', 'SERIAL')):
+            try:
+                return int(stripped)
+            except ValueError:
+                raise ValueError('Enter a valid integer.') from None
+        if isinstance(original, float) or any(token in kind for token in ('REAL', 'FLOA', 'DOUB')):
+            try:
+                return float(stripped)
+            except ValueError:
+                raise ValueError('Enter a valid number.') from None
+        if 'JSON' in kind or isinstance(original, (dict, list)):
+            try:
+                return json.loads(text)
+            except (TypeError, ValueError):
+                raise ValueError('Enter valid JSON.') from None
+        return text
+
+    def _grid_item_changed(self, item):
+        if self._grid_updating or not self.current_connection or self.current_connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            return
+        if self.current_connection.read_only or not any(column.primary_key for column in self.columns):
+            return
+        row_index, column_index = item.row(), item.column()
+        if not 0 <= row_index < len(self.current_result.rows) or not 0 <= column_index < len(self.columns):
+            return
+        column = self.columns[column_index]
+        if column.primary_key:
+            return
+        state = self._workspace_state()
+        row = self.current_result.rows[row_index]
+        key = self._grid_key(row)
+        if not key:
+            return
+        record = state.pending_updates.get(key)
+        if record is None:
+            record = {'keys': {name: row[name] for name in (column.name for column in self.columns if column.primary_key)},
+                      'original': dict(row), 'values': {}}
+            state.pending_updates[key] = record
+        try:
+            value = self._grid_value(column, item.text(), record['original'].get(column.name))
+        except ValueError as error:
+            self._grid_updating = True
+            try:
+                item.setText(display_value(record['original'].get(column.name)))
+            finally:
+                self._grid_updating = False
+            self.show_error(str(error))
+            return
+        original = record['original'].get(column.name)
+        if value == original:
+            record['values'].pop(column.name, None)
+        else:
+            record['values'][column.name] = value
+        row[column.name] = value
+        if not record['values']:
+            state.pending_updates.pop(key, None)
+        item.setData(Qt.ItemDataRole.UserRole, value)
+        item.setToolTip(display_value(value))
+        self.update_context()
+
+    def commit_table_changes(self):
+        connection = self.current_connection
+        state = self._workspace_state()
+        if (not state or not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
+                or connection.read_only or not self._pending_grid_count()):
+            return
+        updates = [(record['keys'], record['values']) for record in state.pending_updates.values()]
+        inserts, deletes = list(state.pending_inserts), list(state.pending_deletes)
+        identity = state.identity
+        state.grid_committing = True
+        self.update_context()
+        def done(result):
+            target = self._workspace_tabs.get(identity, state)
+            if target.closed:
+                return
+            target.grid_committing = False
+            target.pending_updates.clear()
+            target.pending_inserts.clear()
+            target.pending_deletes.clear()
+            target.dirty = True
+            if self._workspace_is_active(target):
+                self.footer_detail.setText(self.t(f'已提交 · {result.affected} 行', f'Committed · {result.affected} rows'))
+                self.refresh_data()
+                self.update_context()
+        def failed(message):
+            if not state.closed:
+                state.grid_committing = False
+                state.error = message
+                if self._workspace_is_active(state):
+                    self.update_context()
+                    self.show_error(message)
+        self.submit(self._connection_operation('apply_grid_changes', connection, self.current_table,
+                                               updates=updates, inserts=inserts, deletes=deletes), done, failed)
+
+    def revert_table_changes(self):
+        state = self._workspace_state()
+        if state is None or not self._pending_grid_count():
+            return
+        state.pending_updates.clear()
+        state.pending_inserts.clear()
+        state.pending_deletes.clear()
+        state.page = self.page = 1
+        self.refresh_data()
+        self.update_context()
 
     def selection_changed(self):
         selected = self._selected_rows()
@@ -2191,7 +2539,7 @@ class MainWindow(QMainWindow):
                 if state.identity[:2] == scope:
                     state.dirty = True
             if self.current_connection and self._workspace_scope(self.current_connection) == scope:
-                self._search_redis_keys()
+                self._refresh_redis_keys()
                 if self.current_table:
                     self.refresh_data()
             return
@@ -2248,8 +2596,9 @@ class MainWindow(QMainWindow):
             return
         connection = self.current_connection
         origin = self._workspace_state()
+        state = origin
         generation = self._generation
-        cid, table = connection.id, self.current_table
+        table = self.current_table
         redis = connection.kind == 'Redis'
         columns = [ColumnInfo('key', 'TEXT', primary_key=True, nullable=False),
                    ColumnInfo('type', 'TEXT', nullable=False, default='string'),
@@ -2270,7 +2619,36 @@ class MainWindow(QMainWindow):
                 self.submit(self._connection_operation('insert_row', connection, table, values), created,
                             lambda message: self._origin_error(origin, message))
             else:
-                self._mutate(lambda: self.service.insert_row(cid, table, values), cid, table)
+                state.pending_inserts.append(dict(values))
+                row = {column.name: values.get(column.name) for column in self.columns}
+                if len(state.current_result.rows) < state.page_size:
+                    state.current_result.rows.append(row)
+                state.current_result.total = state.total_rows + 1
+                self.current_result = state.current_result
+                self.total_rows = state.total_rows = max(state.total_rows + 1, len(state.current_result.rows))
+                self.populate_table(self.data_table, state.current_result, (state.page - 1) * state.page_size)
+                self.update_pager()
+                self.update_context()
+
+    def _stage_update(self, state, keys, values):
+        key = tuple(keys.get(column.name) for column in self.columns if column.primary_key)
+        row = next((item for item in state.current_result.rows if self._grid_key(item) == key), None)
+        if row is None:
+            return
+        record = state.pending_updates.get(key)
+        if record is None:
+            record = {'keys': dict(keys), 'original': dict(row), 'values': {}}
+            state.pending_updates[key] = record
+        for name, value in values.items():
+            if value == record['original'].get(name):
+                record['values'].pop(name, None)
+            else:
+                record['values'][name] = value
+            row[name] = value
+        if not record['values']:
+            state.pending_updates.pop(key, None)
+        self.populate_table(self.data_table, state.current_result, (state.page - 1) * state.page_size)
+        self.update_context()
 
     def delete_redis_key(self):
         connection = self.current_connection
@@ -2292,7 +2670,7 @@ class MainWindow(QMainWindow):
                 target.dirty = True
             if self._workspace_is_active(target):
                 self.refresh_data()
-                self._search_redis_keys()
+                self._refresh_redis_keys()
         def failed(message):
             if not state.closed:
                 state.error = message
@@ -2322,7 +2700,10 @@ class MainWindow(QMainWindow):
             values = {key: value for key, value in dialog.values().items() if key not in keys and (key not in row or value != row[key])}
             if not values:
                 return
-            self._mutate(self._connection_operation('update_row', self.current_connection, table, keys, values), cid, table)
+            if self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+                self._stage_update(self._workspace_state(), keys, values)
+            else:
+                self._mutate(self._connection_operation('update_row', self.current_connection, table, keys, values), cid, table)
 
     def delete_selected_rows(self):
         selected = self._selected_rows()
@@ -2332,7 +2713,35 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(self, self.t('删除记录', 'Delete records'), self.t(f'确认删除选中的 {len(keys)} 条记录？此操作无法撤销。', f'Delete {len(keys)} selected records? This action cannot be undone.'), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
         if answer == QMessageBox.StandardButton.Yes:
             cid, table = self.current_connection.id, self.current_table
-            self._mutate(self._connection_operation('delete_rows', self.current_connection, table, keys), cid, table)
+            if self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+                state = self._workspace_state()
+                selected_keys = {tuple(item.get(column.name) for column in self.columns if column.primary_key)
+                                 for item in (self.current_result.rows[index] for index in selected)}
+                for key_row in keys:
+                    key = tuple(key_row.get(column.name) for column in self.columns if column.primary_key)
+                    insert = next((item for item in state.pending_inserts
+                                   if tuple(item.get(column.name) for column in self.columns if column.primary_key) == key), None)
+                    if insert is not None:
+                        state.pending_inserts.remove(insert)
+                    elif key not in {tuple(item.get(column.name) for column in self.columns if column.primary_key)
+                                     for item in state.pending_deletes}:
+                        state.pending_deletes.append(key_row)
+                state.current_result.rows = [
+                    row for row in state.current_result.rows
+                    if self._grid_key(row) not in selected_keys
+                ]
+                for key in selected_keys:
+                    state.pending_updates.pop(key, None)
+                self.current_result = state.current_result
+                self.total_rows = state.total_rows = max(0, state.total_rows - len(selected_keys))
+                last_page = max(1, math.ceil(state.total_rows / state.page_size))
+                if state.page > last_page:
+                    state.page = self.page = last_page
+                self.refresh_data(force=True)
+                self.update_pager()
+                self.update_context()
+            else:
+                self._mutate(self._connection_operation('delete_rows', self.current_connection, table, keys), cid, table)
 
     def _mutate(self, function, cid, table):
         state = self._workspace_state()

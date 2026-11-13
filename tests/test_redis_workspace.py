@@ -112,7 +112,7 @@ def test_read_only_cannot_delete_entire_key(window, monkeypatch):
 
 def test_catalog_refresh_keeps_search_and_open_value(window, monkeypatch):
     calls = []
-    monkeypatch.setattr(window, '_search_redis_keys', lambda: calls.append('search'))
+    monkeypatch.setattr(window, '_refresh_redis_keys', lambda: calls.append('search'))
     monkeypatch.setattr(window, 'refresh_data', lambda: calls.append('read'))
     window.refresh_catalog()
     assert calls == ['search', 'read']
@@ -134,6 +134,23 @@ def test_returning_to_connection_during_write_reloads_and_unlocks_view(window, m
     assert len(requests) == 3
     requests[1][1](value())
     assert window.redis_view.add_button.isEnabled()
+
+
+def test_setting_redis_ttl_uses_key_scope_and_refreshes_only_the_value(window, monkeypatch):
+    requests = []
+    monkeypatch.setattr(window, 'submit', lambda function, callback=None, error=None:
+                        requests.append((function, callback, error)))
+    refreshed = []
+    monkeypatch.setattr(window, 'refresh_data', lambda: refreshed.append('read'))
+    window._redis_snapshot = value()
+    window.redis_view.set_value(window._redis_snapshot)
+    window.redis_view.ttl_requested.emit(90)
+    assert len(requests) == 1
+    assert requests[0][0].keywords['database'] == '0'
+    assert requests[0][0].keywords['expected_ttl_ms'] == 60000
+    requests[0][1](QueryResult(affected=1))
+    assert refreshed == ['read']
+    assert not window._redis_writes
 
 
 def test_failed_hash_save_reopens_same_draft_with_inline_error(window, qtbot, monkeypatch):

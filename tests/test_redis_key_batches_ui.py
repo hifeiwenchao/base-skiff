@@ -120,7 +120,6 @@ def test_late_batch_only_appends_to_its_original_db(window):
     run_pending(window)
     assert window.current_connection.database == '1'
     window.redis_key_search.setText('db-one:')
-    window.redis_key_timer.stop()
     old[1](page(500, 1000))
     assert len(keys(window, 0)) == 1000
     assert keys(window, 1) == {'team:one'}
@@ -132,14 +131,13 @@ def test_pending_changed_filter_cannot_resume_a_cursor_for_the_previous_prefix(w
     initial_page(window, page(0, 500, object()))
     old_more = more(window)
     window.redis_key_search.setText('different:')
-    window.redis_key_timer.stop()
     calls = []
     monkeypatch.setattr(window.service, 'search_redis_keys',
                         lambda cid, text='', mode='prefix', **kwargs: calls.append(kwargs))
     window.tree_clicked(old_more, 0)
     for function, _callback, _error in window.requests:
         function()
-    assert all(call.get('continuation') is None for call in calls)
+    assert calls == [], 'A draft must neither submit a search nor resume the previous cursor'
 
 
 def test_more_row_has_no_connection_context_menu(window, monkeypatch):

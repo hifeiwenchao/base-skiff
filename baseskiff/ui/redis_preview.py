@@ -19,12 +19,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from baseskiff.redis_codec import json_safe, preview_value, raw_bytes, safe_text
+from baseskiff.redis_codec import ValuePreview, json_safe, preview_value, raw_bytes, safe_text
 
 _TEXT = {
     'zh': {
         'title': 'Redis 值预览 · 只读', 'format': '格式', 'auto': '自动识别',
         'text': '文本', 'json': 'JSON', 'msgpack': 'MessagePack', 'hex': 'Hex',
+        'bson': 'BSON', 'cbor': 'CBOR', 'gzip': 'gzip', 'zlib': 'zlib',
         'base64': 'Base64', 'export': '导出原始字节…', 'close': '关闭',
         'readonly': '预览不会修改或保存原始数据。',
         'nested': '结构预览中的二进制字段使用 Base64 标注；选择独立值可导出原始字节。',
@@ -32,10 +33,12 @@ _TEXT = {
         'notice': '格式提示', 'value': '字段值', 'structure': '完整结构',
         'file_types': '二进制文件 (*.bin);;所有文件 (*)',
         'detected': '已识别：',
+        'field': '字段', 'scalar_value': '值', 'content': '查看内容',
     },
     'en': {
         'title': 'Redis value preview · read-only', 'format': 'Format', 'auto': 'Auto',
         'text': 'Text', 'json': 'JSON', 'msgpack': 'MessagePack', 'hex': 'Hex',
+        'bson': 'BSON', 'cbor': 'CBOR', 'gzip': 'gzip', 'zlib': 'zlib',
         'base64': 'Base64', 'export': 'Export original bytes…', 'close': 'Close',
         'readonly': 'Previewing does not change or save the original data.',
         'nested': 'Binary fields use Base64 annotations in this structure preview. Select an individual value to export its original bytes.',
@@ -43,6 +46,7 @@ _TEXT = {
         'notice': 'Format notice', 'value': 'Field value', 'structure': 'Whole structure',
         'file_types': 'Binary files (*.bin);;All files (*)',
         'detected': 'Detected: ',
+        'field': 'Field', 'scalar_value': 'Value', 'content': 'Content',
     },
 }
 
@@ -54,6 +58,11 @@ _NOTICE_ZH = {
     'Unable to decode as JSON or structure exceeds preview limits; showing Hex.': '无法解码为 JSON 或结构超过预览上限，显示 Hex。',
     'Unable to decode as JSON; showing hexadecimal bytes.': '无法解码为 JSON，显示 Hex 字节。',
     'Unable to decode a complete MessagePack object or structure exceeds preview limits.': '无法解码完整的 MessagePack 对象，或结构超过预览上限。',
+    'Unable to identify a complete serialized object; showing Hex.': '无法解码完整的序列化对象，显示 Hex 字节。',
+    'Unable to decode a complete serialized object; showing Hex.': '无法解码完整的序列化对象，显示 Hex 字节。',
+    'Ambiguous binary scalar; choose JSON/MessagePack/CBOR explicitly.': '二进制标量格式不明确，请明确选择 JSON、MessagePack 或 CBOR。',
+    'Unable to decode complete GZIP/ZLIB stream; showing Hex.': '无法解码完整的 GZIP/ZLIB 流，显示 Hex 字节。',
+    'Compressed contents are not a recognized complete serialization.': '压缩内容不是可识别的完整序列化对象。',
 }
 
 
@@ -62,6 +71,30 @@ _NOTICE_ZH = {
 _NONEDITABLE_TEXT = re.compile(
     '[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff\u00a0\u2028\u2029\ufdd0\ufdd1\ufeff\ufffe]'
 )
+
+
+def preview_format_label(preview: ValuePreview, language: str) -> str:
+    """Describe the recognized decoding chain using the current UI language."""
+    labels = _TEXT.get(language, _TEXT['en'])
+    return ' → '.join(labels.get(name, name) for name in
+                      (getattr(preview, 'chain', ()) or (preview.format,)))
+
+
+def preview_notice(notice: str, language: str) -> str:
+    # Keep the user-facing wording compatible with earlier preview notices;
+    # codec diagnostics may use the more precise "identify" wording.
+    notice = notice.replace(
+        'Unable to identify a complete serialized object; showing Hex.',
+        'Unable to decode a complete serialized object; showing Hex.',
+    )
+    if language == 'zh':
+        notice = notice.replace('Unable to decode complete GZIP stream', '无法解码完整的 GZIP 流')
+        notice = notice.replace('Unable to decode complete ZLIB stream', '无法解码完整的 ZLIB 流')
+        notice = notice.replace('Ambiguous binary scalar; choose JSON/MessagePack/CBOR explicitly.',
+                                '二进制标量格式不明确，请明确选择 JSON、MessagePack 或 CBOR。')
+        for source, translated in _NOTICE_ZH.items():
+            notice = notice.replace(source, translated)
+    return notice
 
 
 def is_editable_text(value: Any) -> bool:
@@ -78,14 +111,17 @@ class RedisPreviewDialog(QDialog):
     """Keep the source object and export its bytes, regardless of display format."""
 
     def __init__(self, value: Any, language: str = 'en', *, format: str = 'auto',
+                 identity: str | bytes | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.raw_value = value
+        self._identity = identity
         self._scalar = isinstance(value, (str, bytes))
         self.setObjectName('redisPreviewDialog')
         self.resize(720, 500)
         layout = QVBoxLayout(self)
-        self._field_values = list(value.items())[:1000] if isinstance(value, dict) else []
+        self._field_values = ([('field', identity)] if identity is not None else
+                              list(value.items())[:1000] if isinstance(value, dict) else [])
         value_toolbar = QHBoxLayout()
         self.value_label = QLabel()
         value_toolbar.addWidget(self.value_label)
@@ -103,13 +139,14 @@ class RedisPreviewDialog(QDialog):
         toolbar.addWidget(self.format_label)
         self.format_combo = QComboBox()
         self.format_combo.setObjectName('redisPreviewFormat')
-        for name in ('auto', 'text', 'json', 'msgpack', 'hex', 'base64'):
+        for name in ('auto', 'text', 'json', 'msgpack', 'bson', 'cbor', 'gzip', 'zlib', 'hex', 'base64'):
             self.format_combo.addItem(name, name)
         self.format_combo.setCurrentIndex(max(0, self.format_combo.findData(format)))
         self.format_combo.setEnabled(self._scalar)
         toolbar.addWidget(self.format_combo)
         self.detected_label = QLabel()
         self.detected_label.setObjectName('redisPreviewDetected')
+        self.detected_label.setWordWrap(True)
         toolbar.addWidget(self.detected_label)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -142,8 +179,10 @@ class RedisPreviewDialog(QDialog):
         self.language = language if language in _TEXT else 'en'
         tr = _TEXT[self.language].__getitem__
         self.setWindowTitle(tr('title'))
-        self.value_label.setText(tr('value'))
-        self.value_combo.setItemText(0, tr('structure'))
+        self.value_label.setText(tr('content' if self._identity is not None else 'value'))
+        self.value_combo.setItemText(0, tr('scalar_value' if self._identity is not None else 'structure'))
+        if self._identity is not None:
+            self.value_combo.setItemText(1, tr('field'))
         self.format_label.setText(tr('format'))
         for index in range(self.format_combo.count()):
             self.format_combo.setItemText(index, tr(self.format_combo.itemData(index)))
@@ -165,11 +204,9 @@ class RedisPreviewDialog(QDialog):
             rendered = rendered.encode('utf-8', errors='backslashreplace').decode('utf-8')
             preview = preview_value(rendered, 'text')
             text, notice = preview.text, preview.notice
-        if self.language == 'zh':
-            for source, translated in _NOTICE_ZH.items():
-                notice = notice.replace(source, translated)
-        detected = preview.format if self._scalar else 'json'
-        self.detected_label.setText(_TEXT[self.language]['detected'] + _TEXT[self.language][detected])
+        notice = preview_notice(notice, self.language)
+        detected = preview_format_label(preview, self.language) if self._scalar else 'JSON'
+        self.detected_label.setText(_TEXT[self.language]['detected'] + detected)
         self.editor.setPlainText(text)
         self.notice_label.setText(f'{_TEXT[self.language]["notice"]}: {notice}' if notice else '')
         self.notice_label.setVisible(bool(notice))

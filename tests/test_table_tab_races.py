@@ -40,7 +40,7 @@ class DeferredOperations:
 
     def __init__(self, window, monkeypatch):
         self.operations = []
-        for name in ('get_schema', 'fetch_rows', 'execute', 'update_row', 'insert_row', 'list_tables'):
+        for name in ('get_schema', 'fetch_rows', 'execute', 'update_row', 'insert_row', 'apply_grid_changes', 'list_tables'):
             method = getattr(window.service, name)
 
             def defer(*args, _method=method, _name=name, **kwargs):
@@ -254,7 +254,8 @@ def test_background_mutation_refreshes_origin_without_replacing_active_rows(wind
 
     QTimer.singleShot(0, accept_edit)
     window.edit_selected_row()
-    mutation = deferred.pending('update_row', 'customers')[0]
+    window.commit_table_changes()
+    mutation = deferred.pending('apply_grid_changes', 'customers')[0]
     window.open_table('orders')
     deferred.finish(table='orders')
     visible_orders = cells(window.data_table)

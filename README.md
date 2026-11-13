@@ -12,7 +12,7 @@
 - 数据源连接可通过左侧箭头收起 / 展开；已载入的连接点击名称也可切换，刷新与语言切换保留状态。
 - 拖动侧栏右侧分隔线可调整宽度，重启自动恢复上次拖动的宽度。
 - Redis 在侧栏选择数据库，按连接中设置的键分隔符显示目录树，支持服务端键搜索、分类型值视图与逐项编辑。
-- 新增、编辑、删除记录；选中行后点击编辑按钮，双击数据行没有特殊操作。SQL 表需要主键才能从网格修改，保存后实际写入数据库。
+- 新增、编辑、删除记录；SQL 表可直接编辑非主键单元格，所有变更点击「提交」后才写入数据库。SQL 表需要主键才能从网格修改；MongoDB 和 Redis 使用各自的编辑入口。
 - SQL / MongoDB JSON / Redis 命令编辑器，运行历史、耗时、错误信息与 CSV 导出。
 - 连接只读模式、本地加密保存密码、中文 / 英文设置持久化。
 - 首次启动创建本地 SQLite 示例库，包含 `customers`、`products`、`orders`、`order_items`、`categories`、`activity_log` 六张关联表；示例可真实增删改查，后续启动保留修改。
@@ -55,7 +55,7 @@ SQLite 选择已有数据库文件。Oracle 使用 python-oracledb **Thin 模式
 
 侧栏点击连接左侧箭头收起 / 展开其表、集合或键，连接名称仍保持可见。已载入且有子项的连接点击名称也可切换展开状态，不重新查询或重置工作区；初次打开或空连接仍点击名称载入。搜索会临时展开匹配的连接，清空搜索后恢复原状态。
 
-从侧栏打开表、集合或 Redis 键后，右侧会保留对应标签页；再次打开同一对象会选中已有标签。点击标签切换，拖动可调整顺序，标签较多时可滚动查看。右击标签可选择「关闭当前标签页」或「关闭其他标签页」，以右击的标签为操作对象。各标签分别保留分页、筛选、排序、已加载数据、查询草稿与结果，以及「数据 / 查询 / 结构」内层页签位置；后台任务完成后只更新其来源标签。关闭标签仅关闭视图，关闭最后一个标签后显示空工作区。
+从侧栏打开表、集合或 Redis 键后，右侧会保留对应标签页；再次打开同一对象会选中已有标签。点击标签切换，拖动可调整顺序，标签较多时可滚动查看。右击标签可选择「关闭当前标签页」「关闭其他标签页」或「关闭所有标签页」；前两项以右击的标签为操作对象，关闭所有标签页后显示空工作区。各标签分别保留分页、筛选、排序、已加载数据、查询草稿与结果，以及「数据 / 查询 / 结构」内层页签位置；后台任务完成后只更新其来源标签。关闭标签仅关闭视图，关闭最后一个标签后显示空工作区。
 
 不同连接、不同数据库中的同名对象使用独立标签。Redis 标签同时绑定 DB 编号与完整原始键标识，包括二进制键；显示标记不会改变操作目标。操作示例与状态说明见[多表标签页](docs/TABLE_TABS.md)，界面示例：[中文](docs/table-tabs-zh.png) / [English](docs/table-tabs-en.png)。
 
@@ -90,6 +90,10 @@ LIMIT 20;
 ```
 
 PostgreSQL、MySQL、SQLite、Oracle 使用各自的 SQL 方言。Oracle 限制结果条数可使用 `FETCH FIRST 20 ROWS ONLY`。
+
+SQL 表数据页上方提供 `WHERE` 和 `ORDER BY` 条件栏。输入 SQL 片段后点击「查询」或按 Enter 执行；可省略关键字，刷新和分页会复用已提交的条件。条件禁止分号、注释和多语句，原有全字段筛选仍可作为快捷筛选。
+
+SQL 表支持直接编辑单元格，主键列保持只读。新增、修改和删除先保存在当前标签页的待提交区，点击「提交」才会在一个事务中写入；「撤销修改」会丢弃本地变更。提交失败时整体回滚并保留待提交内容；切换或关闭有未提交修改的标签页会先提示。没有主键的表继续只读，MongoDB 和 Redis 保持各自的编辑流程。
 
 ### MongoDB
 
@@ -127,11 +131,11 @@ PostgreSQL、MySQL、SQLite、Oracle 使用各自的 SQL 方言。Oracle 限制�
 
 在新建或编辑连接的「数据库」页设置「键分隔符」，默认 `:`。例如 `h:match:cart:stock:1:4205457` 会按 `h → match → cart → stock → 1` 显示目录，叶节点保留完整原始键标识，二进制或特殊文本使用安全显示标记，过长标签会截断。支持 `::`、`/` 等多个字符或其他分隔符；留空则平铺显示。旧连接自动使用 `:`，各连接单独保存设置。
 
-点击目录在本地展开 / 折叠，不重新扫描；点击键查看数据。Redis 键搜索位于当前展开的 DB 分支首行，只搜索该 DB，仅支持前缀和精确两种模式，按连接及 DB 分别保留输入和模式：前缀按字面前缀匹配；精确查找完整字面键名。输入中的 `*`、`?` 或 `[]` 均按普通字符处理。搜索区分大小写，保留输入中的空格。前缀搜索通过服务端 `SCAN MATCH` 获取匹配键并去重，再批量执行 `TYPE`、按分隔符建树，每批最多返回 500 个匹配键，累计展示全部已加载结果；再次展开 DB 或点击「加载更多」续载，精确搜索使用 `EXISTS`。每批最多执行 8 次 SCAN，稀疏搜索可能返回少量或零个匹配键但仍可继续，只有扫描完成时才移除续载入口。刷新或更换搜索条件会重新开始加载。匹配结果保留父目录，目录展开状态按 DB 分别保留，刷新不会重置；查询与修改使用原始键名。目录括号中的数量仅是已加载的后代键数量。
+点击目录在本地展开 / 折叠，不重新扫描；点击键查看数据，保留侧栏当前的横向与纵向滚动位置。Redis 键搜索位于当前展开的 DB 分支首行，只搜索该 DB，仅支持前缀和精确两种模式，按连接及 DB 分别保留输入和模式。输入、清空或切换模式均只修改草稿，点击输入框右侧的搜索按钮或按 Enter 才向 Redis 提交搜索；刷新继续使用上次提交的条件，草稿未提交时暂停续载。匹配规则：前缀按字面前缀匹配；精确查找完整字面键名。输入中的 `*`、`?` 或 `[]` 均按普通字符处理。搜索区分大小写，保留输入中的空格。前缀搜索通过服务端 `SCAN MATCH` 获取匹配键并去重，再批量执行 `TYPE`、按分隔符建树，每批最多返回 500 个匹配键，累计展示全部已加载结果；再次展开 DB 或点击「加载更多」续载，精确搜索使用 `EXISTS`。每批最多执行 8 次 SCAN，稀疏搜索可能返回少量或零个匹配键但仍可继续，只有扫描完成时才移除续载入口。刷新或提交新的搜索条件会重新开始加载。匹配结果保留父目录，目录展开状态按 DB 分别保留，刷新不会重置；查询与修改使用原始键名。目录括号中的数量仅是已加载的后代键数量。
 
-值视图按类型展示：String 原始文本、Hash 字段和值、List 索引和值、Set 成员、ZSet 成员与分数，以及只读 Stream 消息。Redis 驱动保留原始字节，只将可无损解码的 UTF-8 转为文本，二进制值不会因 UTF-8 解码错误而无法打开。点击「查看」，或选中集合中的一行后点击「查看」，可打开只读预览，在 Auto / Text / JSON / MessagePack / Hex / Base64 间切换。JSON 和 MessagePack 仅用于展示，不会自动重新编码或写回数据库。Stream 支持结构预览，再选择单个字段值查看或导出。
+值视图按类型展示：String 原始文本、Hash 字段和值、List 索引和值、Set 成员、ZSet 成员与分数，以及只读 Stream 消息。Redis 驱动保留原始字节，只将可无损解码的 UTF-8 转为文本，二进制值不会因 UTF-8 解码错误而无法打开。点击「查看」，或选中集合中的一行后点击「查看」，可打开只读预览，在 Auto / Text / JSON / MessagePack / BSON / CBOR / gzip / zlib / Hex / Base64 间切换。Auto 只接受完整的单个对象，并识别 JSON、MessagePack、BSON、CBOR 以及完整的 gzip / zlib 压缩流；压缩内容会显示解压和内部格式链。BSON 使用 Extended JSON 保留 ObjectId、Decimal128、日期、二进制等类型；CBOR 保留标签、二进制、重复键和非字符串键。所有解码仅用于展示，不会自动重新编码或写回数据库；无法确定的内容回退 Hex。Stream 支持结构预览，再选择单个字段值查看或导出。
 
-预览窗口可导出其原始单值字节；解码最多处理 1 MiB，显示最多 200,000 个字符，超限会提示，单值原始导出不截断。RedisJSON 使用 `JSON.GET` 读取；其他未知模块类型使用只读 `DUMP` 回退，导出的是包含类型和校验数据的 Redis 序列化值，并非业务原文。私有编码不保证能够解码，仍可选择 Hex / Base64 查看。
+预览窗口可导出其原始单值字节；解码和解压最多处理 1 MiB，显示最多 200,000 个字符，结构深度和条目数也有限制，超限会提示或回退，单值原始导出不截断。gzip / zlib 必须是完整的单一流，尾随数据、校验错误和解压炸弹会回退 Hex。RedisJSON 使用 `JSON.GET` 读取；其他未知模块类型使用只读 `DUMP` 回退，导出的是包含类型和校验数据的 Redis 序列化值，并非业务原文。私有编码不保证能够解码，仍可选择 Hex / Base64 查看。
 
 Hash、Set、ZSet 支持逐项添加、编辑和删除；List 支持按索引编辑与追加，只有完整载入且不超过 1,000 项时才允许删除。二进制内容及 Qt 无法无损保存的特殊文本禁止原文编辑，可只读预览、导出，并按现有规则删除条目或整键；ZSet 的分数编辑不改变成员字节。普通文本的增删改查保持原样，数字和 JSON 文本不会自动转换。集合仍最多预览 1,000 项，预览内搜索按字面子串匹配且不区分大小写，不会向服务端查找其他条目。查看[中文](docs/redis-batches-zh.png) / [英文](docs/redis-batches-en.png)界面及 [Redis 浏览与目录树说明](docs/REDIS_TREE.md)。
 
@@ -223,13 +227,13 @@ New Redis connections start in **DB0**. Both new and edit forms hide the databas
 
 Use the arrow beside a connection to collapse or expand its tables, collections or keys. Clicking the name of a loaded, nonempty connection also toggles it without reloading the workspace. Refresh and language changes preserve this state; clearing a search restores the earlier expansion state.
 
-Opening a table, collection or Redis key from the sidebar keeps it in a tab on the right. Opening the same object again selects its existing tab. Click tabs to switch, drag to reorder, and scroll through the bar when many are open. Right-click a tab for **Close tab** or **Close other tabs**, using the clicked tab as the target. Each tab retains its pagination, filters, sorting, loaded data, query draft and results, and inner **Data / Query / Structure** selection. Background task results update their originating tab. Closing a tab closes its view; closing the last tab leaves an empty workspace.
+Opening a table, collection or Redis key from the sidebar keeps it in a tab on the right. Opening the same object again selects its existing tab. Click tabs to switch, drag to reorder, and scroll through the bar when many are open. Right-click a tab for **Close tab**, **Close other tabs**, or **Close all tabs**. The first two use the clicked tab as the target; closing all tabs leaves an empty workspace. Each tab retains its pagination, filters, sorting, loaded data, query draft and results, and inner **Data / Query / Structure** selection. Background task results update their originating tab. Closing a tab closes its view; closing the last tab leaves an empty workspace.
 
 Identically named objects in different connections or databases have separate tabs. Redis tabs retain the DB index and complete original key identity, including binary keys, so display markers cannot change the operation target. See the [table tabs guide](docs/TABLE_TABS.md) for usage and retained state, or view the [Chinese](docs/table-tabs-zh.png) / [English](docs/table-tabs-en.png) interface.
 
 Drag the divider at the sidebar's right edge to resize it. The default is 240px, with a 200–560px range and at least 640px reserved for the workspace. Narrow windows may limit the available sidebar width. The last dragged width is restored on restart; resizing preserves the open data, query draft and connection state. See the [resized sidebar](docs/sidebar-resize-en.png).
 
-Use SQL for relational databases, JSON command objects for MongoDB (for example `{"find":"customers","filter":{}}`), and one shell-style Redis command per run (for example `GET greeting`). Displayed query rows are capped at 1,000; CSV export contains the displayed result or current page. SQL statements commit per execution. Grid mutations require a primary key for SQL tables. Select a row and use the toolbar edit button to edit it; double-clicking data rows has no special action.
+Use SQL for relational databases, JSON command objects for MongoDB (for example `{"find":"customers","filter":{}}`), and one shell-style Redis command per run (for example `GET greeting`). Displayed query rows are capped at 1,000; CSV export contains the displayed result or current page. The table view provides `WHERE` and `ORDER BY` fragment fields above the grid; click **Apply** or press Enter to execute, and committed conditions are reused for refresh and pagination. Semicolons, comments and multiple statements are rejected. SQL table cells are directly editable except for primary keys. Inserts, edits and deletes stay staged in the tab until **Commit**; **Revert** discards them. A failed commit rolls back the transaction and keeps the staged changes. Tables without a primary key remain read-only, while MongoDB and Redis keep their own editing workflows.
 
 Enable **SSH tunnel** in the connection dialog to use password, private-key or SSH agent authentication. The database address is reached from the SSH server. Verify the server using known_hosts or a trusted SHA256 fingerprint; unknown or changed keys are rejected. All five network databases support tunnels; SQLite uses local files. Database passwords, SSH passwords and key passphrases have separate encrypted local entries. MongoDB tunnels connect to one target without replica discovery or failover.
 
@@ -245,11 +249,11 @@ If `CONFIG` cannot report the database count, for example because of ACL permiss
 
 Set **Key separator** in a Redis connection to group keys into folders. The default is `:`; multiple characters are supported, and an empty separator shows a flat list. Leaves retain complete original key identifiers; binary or special text uses safe display markers, and long labels may be shortened. Folders expand and collapse locally without rescanning. Folder counts cover only loaded descendant keys. Search keeps matching ancestors visible; each DB retains its folder expansion state across refreshes.
 
-Redis key search appears as the first row inside the active expanded DB branch and searches only that DB. It supports only **Prefix** and **Exact**. Input and mode are kept separately for each connection and DB. Prefix matches a literal prefix; Exact checks the literal full key with `EXISTS`. Characters such as `*`, `?` and `[]` are treated literally. Key search is case sensitive and preserves spaces. Prefix uses server `SCAN MATCH`, deduplicates matches, then batches `TYPE` requests and builds the tree using the separator. Each load returns up to 500 matching keys; the tree keeps every loaded key. Reopen the DB or click **Load more** to continue. Each batch performs at most eight SCAN calls, so a sparse search may return few or no keys with a continuation still available. Refreshing or changing the search restarts the scan.
+Redis key search appears as the first row inside the active expanded DB branch and searches only that DB. It supports only **Prefix** and **Exact**. Input and mode are kept separately for each connection and DB. Editing, clearing, or changing the mode only updates a draft; click the search button beside the input or press Enter to submit it to Redis. Refresh uses the last submitted filter, and continuation pauses while a changed draft is pending. Opening a key preserves the sidebar scroll position. Prefix matches a literal prefix; Exact checks the literal full key with `EXISTS`. Characters such as `*`, `?` and `[]` are treated literally. Key search is case sensitive and preserves spaces. Prefix uses server `SCAN MATCH`, deduplicates matches, then batches `TYPE` requests and builds the tree using the separator. Each load returns up to 500 matching keys; the tree keeps every loaded key. Reopen the DB or click **Load more** to continue. Each batch performs at most eight SCAN calls, so a sparse search may return few or no keys with a continuation still available. Refreshing or submitting a new search restarts the scan.
 
-Redis values have native views for String (raw text), Hash (field/value), List (index/value), Set (members), ZSet (member/score) and read-only Stream entries. The driver preserves bytes and converts only losslessly decoded UTF-8 to text, so binary payloads remain readable without UTF-8 errors. Click **View**, or select a collection row and click **View**, for a read-only preview with **Auto / Text / JSON / MessagePack / Hex / Base64**. JSON and MessagePack decoding only affects the preview; it never re-encodes or saves data. Stream previews show the structure and let you choose an individual field value to inspect or export.
+Redis values have native views for String (raw text), Hash (field/value), List (index/value), Set (members), ZSet (member/score) and read-only Stream entries. The driver preserves bytes and converts only losslessly decoded UTF-8 to text, so binary payloads remain readable without UTF-8 errors. Click **View**, or select a collection row and click **View**, for a read-only preview with **Auto / Text / JSON / MessagePack / BSON / CBOR / gzip / zlib / Hex / Base64**. Auto accepts only complete single objects and recognizes JSON, MessagePack, BSON, CBOR, and complete gzip/zlib streams; compressed values show the decompression and inner-format chain. BSON uses Extended JSON to retain ObjectId, Decimal128, dates and binary values. CBOR retains tags, binary data, duplicate keys and non-string keys. Decoding only affects the preview; it never re-encodes or saves data. Stream previews show the structure and let you choose an individual field value to inspect or export.
 
-The preview can export its original scalar bytes. Decoding is limited to 1 MiB and display to 200,000 characters, with notices when limits apply; original scalar exports are not truncated. RedisJSON is read with `JSON.GET`. Unknown module types use a read-only `DUMP` fallback: the exported bytes are Redis serialization with type and checksum data, rather than the original application payload. Private encodings may remain undecodable; Hex and Base64 are available for inspection.
+The preview can export its original scalar bytes. Decoding and decompression are limited to 1 MiB, display to 200,000 characters, and bounded depth and item counts; notices or Hex fallback appear when limits apply. gzip/zlib must contain one complete stream; trailing data, checksum failures and decompression bombs fall back to Hex. Original scalar exports are not truncated. RedisJSON is read with `JSON.GET`. Unknown module types use a read-only `DUMP` fallback: the exported bytes are Redis serialization with type and checksum data, rather than the original application payload. Private encodings may remain undecodable; Hex and Base64 are available for inspection.
 
 Hash, Set and ZSet support individual additions, edits and deletions; List supports index edits and append, with deletion available only for a complete preview of at most 1,000 items. Binary content and special text that Qt cannot save losslessly cannot be edited as raw text. They remain available for read-only preview, export, and entry or whole-key deletion under the existing rules; editing a ZSet score does not change its member bytes. Ordinary text CRUD preserves the text without automatic number or JSON conversion. Collections still show up to 1,000 items. Entry search filters only that loaded preview using case-insensitive literal substrings. See the [Chinese](docs/redis-batches-zh.png) / [English](docs/redis-batches-en.png) views and [Redis browsing guide](docs/REDIS_TREE.md).
 

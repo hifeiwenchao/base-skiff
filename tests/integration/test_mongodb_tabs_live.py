@@ -91,7 +91,6 @@ def mongo_workspace(qtbot, monkeypatch, live_config, live_service, run_tag):
         try:
             if window is not None:
                 window.search_timer.stop()
-                window.redis_key_timer.stop()
                 _drain(qtbot, window)
                 window.close()
                 _drain(qtbot, window)

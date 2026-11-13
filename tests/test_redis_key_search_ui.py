@@ -24,7 +24,6 @@ def window(qtbot, tmp_path):
     seed_database(widget, widget.current_connection, [])
     widget.update_context()
     yield widget
-    widget.redis_key_timer.stop() if hasattr(widget, 'redis_key_timer') else None
     qtbot.waitUntil(lambda: not widget.busy, timeout=15000)
     widget.close()
 
@@ -109,15 +108,17 @@ def test_search_queries_server_without_stripping_key_text(window, qtbot, monkeyp
     assert window._connection_tables[window.connections[0].id]
 
 
-def test_editing_search_discards_previous_response_before_next_debounce(window, monkeypatch):
+def test_editing_draft_preserves_submitted_response_until_next_submission(window, monkeypatch):
     requests = []
     monkeypatch.setattr(window, 'submit', lambda function, callback=None, error=None:
                         requests.append((function, callback, error)))
     window.redis_key_search.setText('old:')
     window._search_redis_keys()
     window.redis_key_search.setText('new:')
-    requests[-1][1](SimpleNamespace(keys=[TableInfo('old:stale')], truncated=False))
-    assert not window.tables
+    requests[-1][1](SimpleNamespace(keys=[TableInfo('old:submitted')], truncated=False))
+    assert [table.name for table in window.tables] == ['old:submitted']
+    assert window.redis_key_search.text() == 'new:'
+    assert len(requests) == 1
     window._search_redis_keys()
     requests[-1][1](SimpleNamespace(keys=[TableInfo('new:fresh')], truncated=False))
     assert [table.name for table in window.tables] == ['new:fresh']

@@ -139,6 +139,28 @@ def test_string_and_missing_preview(redis_browser):
     assert (missing.kind, missing.value, missing.size, missing.ttl_ms) == ("none", None, 0, -2)
 
 
+def test_set_and_clear_key_ttl_preserves_value_and_validates_expected_ttl(redis_browser):
+    adapter, client = redis_browser
+    client.set("record", "value")
+    assert adapter.set_key_ttl("record", 90).affected == 1
+    assert 89_000 <= client.pttl("record") <= 90_000
+    assert client.get("record") == "value"
+    with pytest.raises(ValueError, match="changed|expired"):
+        adapter.set_key_ttl("record", 90, expected_ttl_ms=-1)
+    assert adapter.set_key_ttl("record", None).affected == 1
+    assert client.pttl("record") == -1
+
+
+def test_set_key_ttl_blocks_read_only_and_missing_keys(redis_browser):
+    adapter, client = redis_browser
+    adapter.connection = replace(adapter.connection, read_only=True)
+    with pytest.raises(PermissionError):
+        adapter.set_key_ttl("missing", 10)
+    client.set("record", "value")
+    with pytest.raises(PermissionError):
+        adapter.set_key_ttl("record", 10)
+
+
 def test_large_hash_single_field_changes_preserve_unrelated_fields_and_ttl(redis_browser):
     adapter, client = redis_browser
     client.hset("record", mapping={f"field:{i}": str(i) for i in range(MAX_ROWS + 10)})
@@ -435,6 +457,21 @@ def test_service_records_successful_and_failed_entry_changes(redis_browser, monk
     assert not history[0].success and history[1].success
     assert all("record" in row.query and "hash" in row.query and "field" in row.query for row in history)
     assert history[1].affected == 1
+
+
+def test_service_records_ttl_changes_in_history(redis_browser, monkeypatch, tmp_path):
+    adapter, client = redis_browser
+    service = DatabaseService(tmp_path)
+    connection = service.save_connection(adapter.connection)
+    monkeypatch.setattr("baseskiff.service.adapter_for", lambda actual: adapter)
+    client.set("record", "old")
+    service.set_redis_ttl(connection.id, "record", 42)
+    assert 41_000 <= client.pttl("record") <= 42_000
+    service.set_redis_ttl(connection.id, "record", None)
+    assert client.pttl("record") == -1
+    history = service.list_history()
+    assert len(history) == 2
+    assert all(item.success and 'TTL' in item.query for item in history)
 
 
 def test_ssh_redis_browser_operations_use_one_tunnel(redis_browser, monkeypatch):

@@ -247,14 +247,26 @@ class DatabaseService:
 
         return self._perform(connection_id, description, mutate, database=database)
 
+    def set_redis_ttl(self, connection_id, key, seconds, *, expected_ttl_ms=None, database=None) -> QueryResult:
+        description = f"REDIS TTL {history_value(key)} {history_value(seconds)}"
+
+        def mutate(adapter):
+            if adapter.connection.kind != "Redis":
+                raise ValueError("This operation requires a Redis connection.")
+            return adapter.set_key_ttl(key, seconds, expected_ttl_ms=expected_ttl_ms)
+
+        return self._perform(connection_id, description, mutate, database=database)
+
     def get_schema(self, connection_id, table, *, database=None):
         return adapter_for(self._operation_connection(connection_id, database=database)).get_schema(table)
 
-    def fetch_rows(self, connection_id, table, page=1, page_size=50, search="", sort_column="", descending=False, *, database=None):
+    def fetch_rows(self, connection_id, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by="", *, database=None):
         start = time.perf_counter()
         result = adapter_for(self._operation_connection(connection_id, database=database)).fetch_rows(
             table, page=page, page_size=page_size, search=search,
-            sort_column=sort_column, descending=descending)
+            sort_column=sort_column, descending=descending,
+            where_clause=where_clause, order_by=order_by)
         result.elapsed_ms = (time.perf_counter() - start) * 1000
         return result
 
@@ -292,6 +304,16 @@ class DatabaseService:
     def delete_rows(self, connection_id, table, keys_list, *, database=None):
         description = f"DELETE {history_table(table)} WHERE {history_value(keys_list)}"
         return self._perform(connection_id, description, lambda adapter: adapter.delete_rows(table, keys_list), database=database)
+
+    def apply_grid_changes(self, connection_id, table, *, updates=(), inserts=(), deletes=(), database=None) -> QueryResult:
+        description = f"COMMIT GRID {history_table(table)}"
+
+        def mutate(adapter):
+            if adapter.connection.kind not in {"SQLite", "PostgreSQL", "MySQL", "Oracle"}:
+                raise ValueError("Staged grid editing requires a SQL table.")
+            return adapter.apply_grid_changes(table, updates=updates, inserts=inserts, deletes=deletes)
+
+        return self._perform(connection_id, description, mutate, database=database)
 
     def list_history(self):
         with self._metadata() as db:

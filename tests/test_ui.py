@@ -92,6 +92,10 @@ def test_add_and_edit_dialogs_persist_real_records(qtbot, tmp_path):
         dialog.accept()
     QTimer.singleShot(0, fill_new)
     window.add_row()
+    assert window.total_rows == 129
+    assert window.service.fetch_rows(window.current_connection.id, 'customers').total == 128
+    assert window.commit_table_button.isEnabled()
+    window.commit_table_button.click()
     qtbot.waitUntil(lambda: window.total_rows == 129 and not window.busy, timeout=15000)
     window.data_search.setText('test@example.com')
     qtbot.waitUntil(lambda: window.total_rows == 1 and not window.busy, timeout=15000)
@@ -102,6 +106,9 @@ def test_add_and_edit_dialogs_persist_real_records(qtbot, tmp_path):
         dialog.accept()
     QTimer.singleShot(0, edit_name)
     window.edit_selected_row()
+    assert window.current_result.rows[0]['name'] == 'Edited Customer'
+    assert window.service.fetch_rows(window.current_connection.id, 'customers', search='test@example.com').rows[0]['name'] == 'Test Customer'
+    window.commit_table_button.click()
     qtbot.waitUntil(lambda: not window.busy and window.current_result.rows[0]['name'] == 'Edited Customer', timeout=15000)
     assert len(window.service.list_history()) == 2
     window.close()

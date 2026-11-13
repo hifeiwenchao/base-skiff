@@ -25,7 +25,6 @@ def redis_tabs(qtbot, tmp_path, monkeypatch):
     search_request(requests)[1](RedisKeyPage([TableInfo('A'), TableInfo('B')]))
     window.open_table('B')
     yield window, requests, connection
-    window.redis_key_timer.stop()
     window.search_timer.stop()
     window.close()
 

@@ -3,6 +3,7 @@ import pytest
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QMenu
 
+from tests.test_table_tab_races import DeferredOperations
 from tests.test_table_tabs import idle, tab_index
 from tests.test_table_tabs import window as window
 
@@ -37,8 +38,8 @@ def open_tables(window, qtbot):
 
 
 @pytest.mark.parametrize('language,labels', [
-    ('en', ['Close tab', 'Close other tabs']),
-    ('zh', ['关闭当前标签页', '关闭其他标签页']),
+    ('en', ['Close tab', 'Close other tabs', 'Close all tabs']),
+    ('zh', ['关闭当前标签页', '关闭其他标签页', '关闭所有标签页']),
 ])
 def test_tab_context_menu_closes_the_clicked_inactive_tab(window, qtbot, language, labels):
     open_tables(window, qtbot)
@@ -99,6 +100,82 @@ def test_single_tab_disables_close_others_and_close_current_leaves_empty_workspa
     assert window.table_tabs.count() == 0
     assert window._active_workspace is None
     assert not window.current_table
+
+
+@pytest.mark.parametrize('extra_tables', [(), ('orders', 'products')])
+def test_close_all_tabs_leaves_empty_workspace_and_preserves_source_data(window, qtbot, extra_tables):
+    for table in extra_tables:
+        window.open_table(table)
+        idle(qtbot, window)
+    connection = window.current_connection
+    connections = window.service.list_connections()
+    tables = list(window._connection_tables[connection.id])
+    source_rows = window.service.fetch_rows(connection.id, 'customers').rows
+    window.tree.topLevelItem(0).setExpanded(False)
+
+    def choose(menu):
+        assert menu.actions()[2].isEnabled()
+        menu.actions()[2].trigger()
+
+    open_menu(window, window.table_tabs.tabRect(0).center(), choose)
+    idle(qtbot, window)
+
+    assert window.table_tabs.count() == 0
+    assert window._workspace_tabs == {}
+    assert window._active_workspace is None
+    assert window.current_connection is connection
+    assert window.current_table == ''
+    assert window.data_table.rowCount() == window.query_result_table.rowCount() == 0
+    assert window.query_editor.toPlainText() == ''
+    assert window.service.list_connections() == connections
+    assert window._connection_tables[connection.id] == tables
+    assert not window.tree.topLevelItem(0).isExpanded()
+    assert window.service.fetch_rows(connection.id, 'customers').rows == source_rows
+
+
+def test_close_all_tabs_does_not_reload_dirty_background_tabs(window, qtbot, monkeypatch):
+    window.open_table('orders')
+    idle(qtbot, window)
+    window.data_search.setText('unfinished filter')
+    window.open_table('products')
+    idle(qtbot, window)
+    window.open_table('customers')
+    idle(qtbot, window)
+    reads = []
+    fetch_rows = window.service.fetch_rows
+
+    def observed(*args, **kwargs):
+        reads.append(args[1])
+        return fetch_rows(*args, **kwargs)
+
+    monkeypatch.setattr(window.service, 'fetch_rows', observed)
+    open_menu(window, window.table_tabs.tabRect(tab_index(window, 'orders')).center(),
+              lambda menu: menu.actions()[2].trigger())
+    idle(qtbot, window)
+
+    assert window.table_tabs.count() == 0
+    assert reads == []
+
+
+def test_close_all_tabs_rejects_late_rows_schema_and_query_results(window, monkeypatch):
+    deferred = DeferredOperations(window, monkeypatch)
+    window.open_table('orders')
+    window.query_editor.setPlainText('SELECT 999 AS closed_query')
+    window.run_query()
+    window.open_table('products')
+    open_menu(window, window.table_tabs.tabRect(tab_index(window, 'orders')).center(),
+              lambda menu: menu.actions()[2].trigger())
+
+    deferred.finish()
+
+    assert window.table_tabs.count() == 0
+    assert window._workspace_tabs == {}
+    assert window._active_workspace is None
+    assert window.current_table == ''
+    assert window.data_table.rowCount() == window.schema_table.rowCount() == 0
+    assert window.query_result_table.rowCount() == 0
+    assert window.query_editor.toPlainText() == ''
+    assert window.query_status.text() == ''
 
 
 def test_right_click_on_empty_tab_bar_space_does_not_open_a_menu(window, monkeypatch):

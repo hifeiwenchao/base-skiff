@@ -43,7 +43,6 @@ def open_window(qtbot, monkeypatch, service, connection, table):
 
 def close_window(qtbot, window):
     window.search_timer.stop()
-    window.redis_key_timer.stop()
     drain(qtbot, window)
     window.close()
     drain(qtbot, window)

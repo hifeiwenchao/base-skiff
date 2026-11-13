@@ -360,7 +360,6 @@ def test_native_table_tabs_retain_drafts_results_and_edit_target(postgres, qtbot
         assert not errors, errors
     finally:
         window.search_timer.stop()
-        window.redis_key_timer.stop()
         drain(qtbot, window)
         window.close()
         drain(qtbot, window)

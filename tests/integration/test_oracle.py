@@ -400,7 +400,6 @@ def test_native_qt_table_tabs_preserve_query_drafts_and_edit_the_original_table(
         assert window.query_result_table.item(0, 0).text() == '22'
     finally:
         window.search_timer.stop()
-        window.redis_key_timer.stop()
         idle(qtbot, window)
         window.close()
         idle(qtbot, window)
