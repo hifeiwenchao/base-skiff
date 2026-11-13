@@ -88,7 +88,10 @@ def test_child_search_temporarily_expands_connection_and_restores_collapse(conne
     window.side_search.setText('customers')
     assert root.isExpanded()
     assert not root.isHidden()
-    assert not window.tree.visualItemRect(root.child(0)).isEmpty()
+    table_parent = (next((root.child(index) for index in range(root.childCount())
+                          if root.child(index).data(0, Qt.ItemDataRole.UserRole + 1) == 'sql_tables'), root)
+                    if kind == 'PostgreSQL' else root)
+    assert not window.tree.visualItemRect(table_parent.child(0)).isEmpty()
 
     window.side_search.clear()
     assert not root.isExpanded()
@@ -144,8 +147,12 @@ def test_empty_connection_label_activates_or_retries(connection_tree, qtbot, mon
     position = QPoint(rectangle.left() + 40, rectangle.center().y())
 
     qtbot.mouseClick(window.tree.viewport(), Qt.MouseButton.LeftButton, pos=position)
-    assert root.childCount() == 0
-    assert activated == [(connection, '')]
+    if loaded:
+        assert root.childCount() == 3
+        assert activated == []
+    else:
+        assert root.childCount() == 0
+        assert activated == [(connection, '')]
     assert opened == []
 
 

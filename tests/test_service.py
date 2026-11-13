@@ -109,6 +109,28 @@ def test_query_cap_and_durable_success_failure_history(service, local, tmp_path)
     assert service.list_history() == []
 
 
+def test_sql_console_text_is_persistent_and_scoped_by_connection_and_database(service, tmp_path):
+    service.save_console("connection-a", "db-a", "SELECT 1")
+    service.save_console("connection-a", "db-b", "SELECT 2")
+    service.save_console("connection-b", "db-a", "SELECT 3")
+
+    assert service.load_console("connection-a", "db-a") == "SELECT 1"
+    assert service.load_console("connection-a", "db-b") == "SELECT 2"
+    assert service.load_console("connection-b", "db-a") == "SELECT 3"
+    assert service.load_console("connection-a", "missing") == ""
+
+    reopened = DatabaseService(tmp_path)
+    assert reopened.load_console("connection-a", "db-a") == "SELECT 1"
+    reopened.save_console("connection-a", "db-a", "")
+    assert reopened.load_console("connection-a", "db-a") == ""
+
+
+def test_deleting_connection_removes_its_sql_console_text(service, local):
+    service.save_console(local.id, "work.sqlite", "SELECT 1")
+    service.delete_connection(local.id)
+    assert service.load_console(local.id, "work.sqlite") == ""
+
+
 def test_passwords_never_enter_metadata_and_connection_edits_persist(service, local, tmp_path):
     secret = "never-write-this-password"
     saved = service.save_connection(replace(local, password=secret, name="Renamed", group="Development"))

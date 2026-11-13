@@ -138,6 +138,12 @@ class DatabaseService:
                     database TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS credentials (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS sql_consoles (
+                    connection_id TEXT NOT NULL,
+                    database TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (connection_id, database));
                 CREATE TABLE IF NOT EXISTS redis_searches (
                     id TEXT PRIMARY KEY,
                     connection_id TEXT NOT NULL,
@@ -251,6 +257,7 @@ class DatabaseService:
         with self._metadata() as db:
             db.execute("DELETE FROM connections WHERE id=?", (connection_id,))
             db.execute("DELETE FROM redis_searches WHERE connection_id=?", (connection_id,))
+            db.execute("DELETE FROM sql_consoles WHERE connection_id=?", (connection_id,))
             for field in SECRET_FIELDS:
                 db.execute('DELETE FROM credentials WHERE key=?', (secret_key(connection_id, field),))
 
@@ -403,6 +410,28 @@ class DatabaseService:
         with self._metadata() as db:
             rows = db.execute(f"SELECT * FROM history{where} ORDER BY rowid DESC LIMIT 1000", values).fetchall()
         return [HistoryEntry(**{**dict(row), "success": bool(row["success"])}) for row in rows]
+
+    def load_console(self, connection_id, database=''):
+        with self._metadata() as db:
+            row = db.execute(
+                "SELECT content FROM sql_consoles WHERE connection_id=? AND database=?",
+                (str(connection_id), '' if database is None else str(database)),
+            ).fetchone()
+        return row["content"] if row else ''
+
+    def save_console(self, connection_id, database, content):
+        if not isinstance(content, str):
+            raise ValueError("Console content must be text.")
+        connection_id = str(connection_id)
+        database = '' if database is None else str(database)
+        with self._metadata() as db:
+            db.execute(
+                """INSERT INTO sql_consoles (connection_id, database, content, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(connection_id, database) DO UPDATE SET
+                       content=excluded.content, updated_at=excluded.updated_at""",
+                (connection_id, database, content, self._now()),
+            )
 
     def count_history(self):
         """Count the displayed history without loading full query/error bodies."""

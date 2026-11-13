@@ -126,6 +126,7 @@ _STRINGS: dict[str, tuple[str, str]] = {
     "value": ("值", "Value"),
     "schema": ("模式", "Schema"),
     "data": ("数据", "Data"),
+    "console": ("控制台", "Console"),
     "query": ("查询", "Query"),
     "sql_editor": ("查询编辑器", "Query editor"),
     "structure": ("结构", "Structure"),

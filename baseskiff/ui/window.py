@@ -167,6 +167,20 @@ class RedisSearchModeCombo(QComboBox):
             painter, x, (self.height() - 14) // 2, 14, 14)
 
 
+class QueryEditor(QPlainTextEdit):
+    """SQL editor with a selection-only Shift+Enter execution gesture."""
+
+    execute_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            event.accept()
+            self.execute_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class TableTabBar(QTabBar):
     """Right-click menus target tabs without activating their workspace."""
 
@@ -281,12 +295,22 @@ class MainWindow(QMainWindow):
         self._workspace_tabs = {}
         self._connection_workspaces = {}
         self._active_workspace = None
+        # SQL Console is scoped by connection + database rather than by a
+        # table tab.  Keep its transient result/status in memory while the
+        # editor text is persisted through DatabaseService.
+        self._console_workspaces = {}
+        self._console_scope = None
+        self._console_save_timer = None
         self.setWindowTitle('BaseSkiff — Your data, in one place')
         self.setWindowIcon(icon('boat', '#397b60', 64))
         self.resize(1440, 900)
         self.setMinimumSize(1080, 700)
         self.setStyleSheet(STYLE)
         self._build()
+        self._console_save_timer = QTimer(self)
+        self._console_save_timer.setSingleShot(True)
+        self._console_save_timer.setInterval(350)
+        self._console_save_timer.timeout.connect(self._save_console_now)
         self._shortcuts()
         self.retranslate()
         self.connections = self.service.list_connections()
@@ -517,9 +541,18 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.setContentsMargins(29, 0, 29, 0)
         self.tabs.addTab(self._data_tab(), icon('table', '#78937a', 15), '')
-        self.tabs.addTab(self._query_tab(), icon('code', '#78937a', 15), '')
+        # Keep a hidden compatibility slot for callers that still select the
+        # former Query index.  The editor itself lives in the independent
+        # Console workspace below, so table workspaces expose only Data and
+        # Structure to users.
+        self.tabs.addTab(QWidget(), icon('code', '#78937a', 15), '')
+        self.tabs.setTabVisible(1, False)
         self.tabs.addTab(self._schema_tab(), icon('columns', '#78937a', 15), '')
         main.addWidget(self.tabs, 1)
+        self.console_page = self._query_tab()
+        self.console_page.setObjectName('consolePage')
+        main.addWidget(self.console_page, 1)
+        self.console_page.hide()
         return page
 
     def _make_table(self):
@@ -675,9 +708,11 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.run_button)
         page_layout.addLayout(tools)
         splitter = QSplitter(Qt.Orientation.Vertical)
-        self.query_editor = QPlainTextEdit()
+        self.query_editor = QueryEditor()
         self.query_editor.setMinimumHeight(130)
         self.highlighter = QueryHighlighter(self.query_editor.document())
+        self.query_editor.textChanged.connect(self._console_text_changed)
+        self.query_editor.execute_requested.connect(self.run_query)
         splitter.addWidget(self.query_editor)
         results = QWidget()
         results_layout = layout(results, 0, 9)
@@ -869,7 +904,11 @@ class MainWindow(QMainWindow):
             self.render_history(self._history)
 
     def _shortcuts(self):
-        for shortcut, callback in [('Ctrl+Return', self.run_query), ('Meta+Return', self.run_query), ('Ctrl+k', self.side_search.setFocus), ('Meta+k', self.side_search.setFocus), ('Ctrl+n', self.add_connection), ('Meta+n', self.add_connection), ('Ctrl+r', self.refresh_data), ('Meta+r', self.refresh_data)]:
+        for shortcut, callback in [('Ctrl+Return', self.run_query), ('Meta+Return', self.run_query),
+                                   ('Shift+Return', self.run_query), ('Ctrl+k', self.side_search.setFocus),
+                                   ('Meta+k', self.side_search.setFocus), ('Ctrl+n', self.add_connection),
+                                   ('Meta+n', self.add_connection), ('Ctrl+r', self.refresh_data),
+                                   ('Meta+r', self.refresh_data)]:
             action = QShortcut(QKeySequence(shortcut), self)
             action.activated.connect(callback)
 
@@ -1238,26 +1277,48 @@ class MainWindow(QMainWindow):
                     other.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
                     root.addChild(other)
             else:
-                for table in self._connection_tables.get(connection.id, []):
+                tables = self._connection_tables.get(connection.id, [])
+                sql_tables = None
+                if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and connection.id in self._connection_tables:
+                    database = self._history_database(connection)
+                    console = QTreeWidgetItem([self.t('控制台', 'Console')])
+                    console.setIcon(0, icon('code', '#9da994', 14))
+                    console.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
+                    console.setData(0, NODE_KIND_ROLE, 'sql_console')
+                    console.setData(0, NODE_ID_ROLE, ('sql_console', connection.id, database))
+                    console.setData(0, SCOPE_ROLE, (connection.id, database))
+                    console.setData(0, SEARCH_ROLE, self.t('控制台', 'Console'))
+                    root.addChild(console)
+
+                    history = QTreeWidgetItem([self.t('操作历史', 'History')])
+                    history.setIcon(0, icon('history', '#9da994', 14))
+                    history.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
+                    history.setData(0, NODE_KIND_ROLE, 'sql_history')
+                    history.setData(0, NODE_ID_ROLE, ('sql_history', connection.id, database))
+                    history.setData(0, SCOPE_ROLE, (connection.id, database))
+                    history.setData(0, SEARCH_ROLE, self.t('操作历史', 'History'))
+                    root.addChild(history)
+
+                    sql_tables = QTreeWidgetItem([self.t('数据表', 'Tables')])
+                    sql_tables.setIcon(0, icon('table', '#9da994', 14))
+                    sql_tables.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
+                    sql_tables.setData(0, NODE_KIND_ROLE, 'sql_tables')
+                    sql_tables.setData(0, NODE_ID_ROLE, ('sql_tables', connection.id, database))
+                    sql_tables.setData(0, SCOPE_ROLE, (connection.id, database))
+                    sql_tables.setData(0, SEARCH_ROLE, self.t('数据表', 'Tables'))
+                    root.addChild(sql_tables)
+                    self._tree_expansion.setdefault(sql_tables.data(0, NODE_ID_ROLE), True)
+
+                table_parent = sql_tables or root
+                for table in tables:
                     child = QTreeWidgetItem([table.name])
                     child.setIcon(0, icon('table', '#9da994', 14))
                     child.setData(0, Qt.ItemDataRole.UserRole, (connection.id, table.qualified_name))
                     child.setData(0, NODE_KIND_ROLE, 'table')
                     child.setData(0, NODE_ID_ROLE, ('table', connection.id, table.qualified_name))
                     child.setData(0, SEARCH_ROLE, table.name)
-                    root.addChild(child)
+                    table_parent.addChild(child)
                     leaves[(table.qualified_name, connection.database or '0')] = child
-                if (connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
-                        and self._connection_tables.get(connection.id)):
-                    history = QTreeWidgetItem([self.t('操作历史', 'History')])
-                    history.setIcon(0, icon('history', '#9da994', 14))
-                    history.setData(0, Qt.ItemDataRole.UserRole, (connection.id, ''))
-                    history.setData(0, NODE_KIND_ROLE, 'sql_history')
-                    database = self._history_database(connection)
-                    history.setData(0, NODE_ID_ROLE, ('sql_history', connection.id, database))
-                    history.setData(0, SCOPE_ROLE, (connection.id, database))
-                    history.setData(0, SEARCH_ROLE, self.t('操作历史', 'History'))
-                    root.addChild(history)
             root_identity = root.data(0, NODE_ID_ROLE)
             self._tree_expansion.setdefault(root_identity, bool(self.current_connection and self.current_connection.id == connection.id))
             selected = leaves.get((active_key[1], active_key[2])) if active_key and active_key[0] == connection.id else None
@@ -1299,7 +1360,7 @@ class MainWindow(QMainWindow):
     def _capture_tree_expansion(self):
         for item in iter_items(self.tree.invisibleRootItem()):
             kind, identity = item.data(0, NODE_KIND_ROLE), item.data(0, NODE_ID_ROLE)
-            if kind not in {'connection', 'redis_database', 'redis_folder'}:
+            if kind not in {'connection', 'redis_database', 'redis_folder', 'sql_tables'}:
                 continue
             scope = item.data(0, SCOPE_ROLE)
             if kind == 'redis_folder' and (scope in self._redis_filtered_results or
@@ -1345,7 +1406,7 @@ class MainWindow(QMainWindow):
             if connection:
                 self._request_redis_keys(replace(connection, database=scope[1]), append=True)
             return
-        if kind in {'redis_folder', 'redis_database'} or (kind == 'connection' and item.childCount()):
+        if kind in {'redis_folder', 'redis_database', 'sql_tables'} or (kind == 'connection' and item.childCount()):
             item.setExpanded(not item.isExpanded())
             return
         cid, table = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1355,6 +1416,10 @@ class MainWindow(QMainWindow):
         if kind == 'sql_history':
             scope = item.data(0, SCOPE_ROLE) or (connection.id, self._history_database(connection))
             self.show_history(connection, scope[1])
+            return
+        if kind == 'sql_console':
+            scope = item.data(0, SCOPE_ROLE) or (connection.id, self._history_database(connection))
+            self.show_console(connection, scope[1])
             return
         if kind == 'redis_other_database':
             database, accepted = QInputDialog.getInt(self, self.t('选择 Redis 数据库', 'Select Redis database'),
@@ -1374,6 +1439,7 @@ class MainWindow(QMainWindow):
             self.activate_connection(connection, self.current_table)
 
     def activate_connection(self, connection, initial_table='', open_query=None):
+        self._leave_console()
         if connection.kind == 'Redis':
             if initial_table or open_query is not None:
                 scope = self._redis_scope(connection)
@@ -1417,12 +1483,10 @@ class MainWindow(QMainWindow):
                 self.open_table(target)
             else:
                 self.update_context()
-                self.tabs.setCurrentIndex(1)
-                if not self.query_editor.toPlainText():
+                if open_query is None and not self.query_editor.toPlainText():
                     self.insert_query_template()
             if open_query is not None:
-                self.query_editor.setPlainText(open_query)
-                self.tabs.setCurrentIndex(1)
+                self.show_console(connection, self._history_database(connection), content=open_query)
         def failed(message):
             if generation == self._generation:
                 self.connection_badge.setText(self.t('连接失败', 'Connection failed'))
@@ -1815,6 +1879,107 @@ class MainWindow(QMainWindow):
         return (state is not None and state is self._active_workspace and self.current_connection is not None and
                 state.identity == (*self._workspace_scope(self.current_connection), self.current_table))
 
+    @staticmethod
+    def _console_scope_for(connection, database=None):
+        if not connection:
+            return None
+        if database is None:
+            database = MainWindow._history_database(connection)
+        return connection.id, '' if database is None else str(database)
+
+    def _console_text_changed(self):
+        """Keep Console edits local and persist them after a short idle period."""
+        scope = self._console_scope
+        if scope is None or self._closed:
+            return
+        state = self._console_workspaces.get(scope)
+        if state is None:
+            return
+        state.query_text = self.query_editor.toPlainText()
+        cursor = self.query_editor.textCursor()
+        state.query_cursor = cursor.position(), cursor.anchor()
+        if self._console_save_timer is not None:
+            self._console_save_timer.start()
+
+    def _save_console_now(self):
+        if self._console_save_timer is not None:
+            self._console_save_timer.stop()
+        scope = self._console_scope
+        if scope is None:
+            return
+        state = self._console_workspaces.get(scope)
+        if state is None or self._closed:
+            return
+        content = self.query_editor.toPlainText() if self._console_scope == scope else state.query_text
+        state.query_text = content
+        try:
+            self.service.save_console(scope[0], scope[1], content)
+        except Exception as error:
+            if not self._closed:
+                self.show_error(str(error))
+
+    def _leave_console(self):
+        if self._console_scope is None:
+            return
+        self._save_console_now()
+        self._console_scope = None
+        self._active_workspace = None
+
+    def show_console(self, connection, database=None, content=None):
+        """Open the persistent SQL Console for one connection/database pair."""
+        if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            return
+        scope = self._console_scope_for(connection, database)
+        if scope is None:
+            return
+        if self._console_scope != scope:
+            self._save_console_now()
+            self._capture_workspace()
+            state = self._console_workspaces.get(scope)
+            if state is None:
+                state = WorkspaceTab(connection)
+                state.query_text = self.service.load_console(scope[0], scope[1])
+                self._console_workspaces[scope] = state
+            else:
+                state.connection = connection
+            self._active_workspace = None
+            self._console_scope = scope
+            self.current_connection = connection
+            self.current_table = ''
+            self.columns = []
+            self.current_result = QueryResult()
+            self.query_result = state.query_result
+            self._query_running = state.query_running
+            self._query_state = state.query_state
+            self._query_error = state.query_error
+            self._redis_snapshot = None
+            self.query_editor.blockSignals(True)
+            self.query_editor.setPlainText(state.query_text)
+            self.query_editor.blockSignals(False)
+            cursor = self.query_editor.textCursor()
+            position, anchor = state.query_cursor
+            end = self.query_editor.document().characterCount() - 1
+            cursor.setPosition(min(anchor, end))
+            cursor.setPosition(min(position, end), cursor.MoveMode.KeepAnchor)
+            self.query_editor.setTextCursor(cursor)
+            self.populate_table(self.query_result_table, state.query_result)
+        else:
+            self.current_connection = connection
+        state = self._console_workspaces[scope]
+        if content is not None:
+            self.query_editor.setPlainText(content)
+            state.query_text = content
+        self._navigation = 'workspace'
+        self.stack.setCurrentIndex(0)
+        self.update_context()
+        self.update_query_status()
+        self.update_nav()
+
+    def _console_state(self):
+        if self._console_scope is None:
+            return None
+        return self._console_workspaces.get(self._console_scope)
+
     def _table_tab_changed(self, index):
         if index < 0:
             return
@@ -1826,6 +1991,7 @@ class MainWindow(QMainWindow):
                 self.table_tabs.setCurrentIndex(current)
                 self.table_tabs.blockSignals(False)
                 return
+            self._leave_console()
             self._activate_workspace(state)
 
     @staticmethod
@@ -1965,6 +2131,9 @@ class MainWindow(QMainWindow):
             self.redis_view.string_editor.setPlainText(state.redis_draft)
         self.redis_view.set_busy(state.identity in self._redis_writes or state.loading)
         self.inspector.setVisible(state.inspector)
+        # Keep the legacy index in memory for callers that still run a query
+        # directly from a table; the Query tab itself remains hidden and all
+        # normal SQL execution happens in Console.
         self.tabs.setCurrentIndex(state.inner_tab)
         header = self.data_table.horizontalHeader()
         header.setSortIndicatorShown(bool(state.sort_column))
@@ -2025,6 +2194,8 @@ class MainWindow(QMainWindow):
                 self._clear_workspace(self.current_connection)
 
     def _clear_workspace(self, connection=None):
+        self._save_console_now()
+        self._console_scope = None
         self.search_timer.stop()
         self._generation += 1
         self._redis_key_request += 1
@@ -2088,6 +2259,7 @@ class MainWindow(QMainWindow):
     def open_table(self, table):
         if not self.current_connection:
             return
+        self._leave_console()
         identity = (*self._workspace_scope(self.current_connection), table)
         state = self._workspace_tabs.get(identity)
         if state is not None:
@@ -2401,6 +2573,10 @@ class MainWindow(QMainWindow):
     def update_context(self):
         connection = self.current_connection
         self._sync_redis_search()
+        console_active = self._console_scope is not None
+        self.table_tabs.setVisible(not console_active)
+        self.tabs.setVisible(not console_active)
+        self.console_page.setVisible(console_active)
         redis = bool(connection and connection.kind == 'Redis')
         self.data_views.setCurrentWidget(self.redis_view if redis else self.data_splitter)
         self.data_search.setVisible(not redis)
@@ -2445,7 +2621,8 @@ class MainWindow(QMainWindow):
         self.revert_table_button.setEnabled(bool(sql_table and pending))
         self.run_button.setEnabled(connection is not None and not self._query_running)
         self.export_button.setEnabled(bool(self.current_result.columns))
-        self.query_hint.setText(self.t('⌘ / Ctrl + Enter 执行 · 最多返回 1,000 行', '⌘ / Ctrl + Enter to run · Up to 1,000 rows'))
+        self.query_hint.setText(self.t('⌘ / Ctrl + Enter 执行 · Shift + Enter 执行选中 · 最多返回 1,000 行',
+                                      '⌘ / Ctrl + Enter to run · Shift + Enter selection · Up to 1,000 rows'))
         if connection and connection.kind == 'MongoDB':
             self.query_hint.setText(self.t('JSON 命令：find / insertOne / updateOne / deleteOne', 'JSON commands: find / insertOne / updateOne / deleteOne'))
         elif connection and connection.kind == 'Redis':
@@ -2645,11 +2822,20 @@ class MainWindow(QMainWindow):
     def run_query(self):
         if not self.current_connection or not self.query_editor.toPlainText().strip() or not self.run_button.isEnabled():
             return
-        self.show_workspace()
-        self.tabs.setCurrentIndex(1)
+        console_active = self._console_scope is not None
+        if console_active:
+            self.show_workspace()
+        else:
+            # Keep direct programmatic callers compatible with the former
+            # table Query action; the visible table workspace no longer
+            # exposes that inner tab.
+            self.show_workspace()
+            self.tabs.setCurrentIndex(1)
         cursor = self.query_editor.textCursor()
         query = cursor.selectedText().replace('\u2029', '\n') if cursor.hasSelection() else self.query_editor.toPlainText()
-        state = self._workspace_state()
+        state = self._console_state() if console_active else self._workspace_state()
+        if state is None:
+            return
         connection = state.connection
         request = state.request('query')
         self._query_running, self._query_state = True, 'running'
@@ -2664,7 +2850,8 @@ class MainWindow(QMainWindow):
                     self.refresh_catalog(connection, owner=state)
                 return
             state.query_running, state.query_state, state.query_result = False, 'success', result
-            if self._workspace_is_active(state):
+            active_console = self._console_scope == self._console_scope_for(connection)
+            if (active_console or self._workspace_is_active(state)):
                 self._query_running, self._query_state, self.query_result = False, 'success', result
                 self.populate_table(self.query_result_table, result)
                 self.update_context()
@@ -2676,7 +2863,8 @@ class MainWindow(QMainWindow):
                 return
             state.query_running, state.query_state, state.query_error = False, 'failed', message
             state.query_result = QueryResult()
-            if self._workspace_is_active(state):
+            active_console = self._console_scope == self._console_scope_for(connection)
+            if active_console or self._workspace_is_active(state):
                 self._query_running, self._query_state, self._query_error = False, 'failed', message
                 self.query_result = state.query_result
                 self.populate_table(self.query_result_table, self.query_result)
@@ -3005,6 +3193,13 @@ class MainWindow(QMainWindow):
         self.submit(partial(self.service.delete_connection, connection.id), done)
 
     def _close_connection_tabs(self, cid):
+        if self._console_scope is not None and self._console_scope[0] == cid:
+            self._save_console_now()
+            self._console_scope = None
+            self._active_workspace = None
+        for scope in list(self._console_workspaces):
+            if scope[0] == cid:
+                self._console_workspaces.pop(scope, None)
         for index in reversed(range(self.table_tabs.count())):
             if self.table_tabs.tabData(index)[0] == cid:
                 self.close_table_tab(index)
@@ -3211,9 +3406,12 @@ class MainWindow(QMainWindow):
                 or self._redis_scope(self.current_connection) != self._redis_scope(connection)):
             self.activate_connection(connection, open_query=query)
             return
-        self.show_workspace()
-        self.tabs.setCurrentIndex(1)
-        self.query_editor.setPlainText(query)
+        if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            self.show_console(connection, self._history_database(connection), content=query)
+        else:
+            self.show_workspace()
+            self.tabs.setCurrentIndex(1)
+            self.query_editor.setPlainText(query)
 
     def clear_history(self):
         response = QMessageBox.question(self, self.t('清空历史', 'Clear history'), self.t('确认清空本机的全部操作历史？此操作无法撤销。', 'Clear all local operation history? This cannot be undone.'), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
@@ -3234,6 +3432,7 @@ class MainWindow(QMainWindow):
             'BaseSkiff 0.1.0\nA thoughtful workspace for your databases.\n\n• Use + to add a connection; right-click to edit or remove.\n• Select a record and click Edit in the toolbar; select several to delete.\n• Tables without a primary key can be changed in the query editor.\n• Export saves the current page or current query result as CSV.\n• ⌘ / Ctrl + Enter runs queries; + K finds; + N adds a connection.\n• Passwords are encrypted on this computer and remain available after restarting.\n\nSQL: standard SQL, one statement at a time\nMongoDB: JSON commands, e.g. {"find": "users", "filter": {}}\nRedis: commands, e.g. GET mykey\n\nThe local playground is yours to explore, with no external connection.'))
 
     def closeEvent(self, event):
+        self._save_console_now()
         self._closed = True
         self.settings.setValue('language', self.language)
         event.accept()
