@@ -139,6 +139,15 @@ def test_string_and_missing_preview(redis_browser):
     assert (missing.kind, missing.value, missing.size, missing.ttl_ms) == ("none", None, 0, -2)
 
 
+def test_insert_typed_key_applies_value_and_ttl_atomically(redis_browser):
+    adapter, client = redis_browser
+
+    assert adapter.insert_row("", {"key": "profile", "type": "hash",
+                                    "value": {"name": "Ada"}, "ttl": 60}).affected == 1
+    assert client.hgetall("profile") == {"name": "Ada"}
+    assert 59_000 <= client.pttl("profile") <= 60_000
+
+
 def test_set_and_clear_key_ttl_preserves_value_and_validates_expected_ttl(redis_browser):
     adapter, client = redis_browser
     client.set("record", "value")

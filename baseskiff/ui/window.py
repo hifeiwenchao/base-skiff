@@ -65,7 +65,7 @@ from baseskiff.models import DATABASE_COLORS, ColumnInfo, Connection, QueryResul
 from baseskiff.redis_codec import json_safe, safe_text
 from baseskiff.service import DatabaseService
 from baseskiff.ui.connection_type import ConnectionTypeDialog
-from baseskiff.ui.dialogs import ConnectionDialog, RowDialog
+from baseskiff.ui.dialogs import ConnectionDialog, RedisKeyDialog, RowDialog
 from baseskiff.ui.editor import QueryHighlighter
 from baseskiff.ui.icons import icon
 from baseskiff.ui.redis_tree import (
@@ -2774,15 +2774,14 @@ class MainWindow(QMainWindow):
         generation = self._generation
         table = self.current_table
         redis = connection.kind == 'Redis'
-        columns = [ColumnInfo('key', 'TEXT', primary_key=True, nullable=False),
-                   ColumnInfo('type', 'TEXT', nullable=False, default='string'),
-                   ColumnInfo('value', 'JSON', nullable=False, default='')] if redis else self.columns
-        if not columns:
-            return
-        dialog = RowDialog(columns, parent=self, language=self.language,
-                           bson_mode=connection.kind == 'MongoDB')
         if redis:
+            dialog = RedisKeyDialog(parent=self, language=self.language)
             dialog.setWindowTitle(self.t('新建 key', 'New key') + f' · DB{connection.database or "0"}')
+        else:
+            if not self.columns:
+                return
+            dialog = RowDialog(self.columns, parent=self, language=self.language,
+                               bson_mode=connection.kind == 'MongoDB')
         if dialog.exec():
             values = dialog.values()
             if redis:

@@ -10,7 +10,8 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from threading import RLock
 
@@ -53,6 +54,62 @@ def history_value(value):
 
 def history_table(table):
     return history_value(table) if isinstance(table, bytes) else table
+
+
+def history_sql_identifier(identifier, kind, *, qualified=False):
+    """Render a SQL identifier for the operation history preview."""
+    if isinstance(identifier, bytes):
+        return history_value(identifier)
+    text = str(identifier)
+    quote = '`' if kind == 'MySQL' else '"'
+    parts = text.split('.', 1) if qualified and kind in {'PostgreSQL', 'Oracle'} and '.' in text else [text]
+    return '.'.join(quote + part.replace(quote, quote * 2) + quote for part in parts)
+
+
+def history_sql_literal(value):
+    """Render a bound value as a readable SQL literal without executing it."""
+    if value is None:
+        return 'NULL'
+    if isinstance(value, bool):
+        return 'TRUE' if value else 'FALSE'
+    if isinstance(value, (int, float, Decimal)):
+        return str(value)
+    if isinstance(value, (date, datetime)):
+        value = value.isoformat()
+    elif isinstance(value, (dict, list, tuple)):
+        value = json.dumps(json_safe(value), ensure_ascii=False, default=str)
+    elif isinstance(value, bytes):
+        return "X'" + value.hex() + "'"
+    else:
+        value = str(value)
+    return "'" + value.replace("'", "''") + "'"
+
+
+def grid_history_sql(kind, table, updates=(), inserts=(), deletes=()):
+    """Describe the exact staged SQL statements committed as one transaction."""
+    table_sql = history_sql_identifier(table, kind, qualified=True)
+    statements = []
+    for keys, values in updates:
+        assignments = ', '.join(
+            f'{history_sql_identifier(name, kind)} = {history_sql_literal(value)}'
+            for name, value in values.items())
+        where = ' AND '.join(
+            f'{history_sql_identifier(name, kind)} = {history_sql_literal(value)}'
+            for name, value in keys.items())
+        statements.append(f'UPDATE {table_sql} SET {assignments} WHERE {where};')
+    for values in inserts:
+        if values:
+            columns = ', '.join(history_sql_identifier(name, kind) for name in values)
+            literals = ', '.join(history_sql_literal(value) for value in values.values())
+            statements.append(f'INSERT INTO {table_sql} ({columns}) VALUES ({literals});')
+        else:
+            statements.append(f'INSERT INTO {table_sql} DEFAULT VALUES;')
+    for keys in deletes:
+        where = ' AND '.join(
+            f'{history_sql_identifier(name, kind)} = {history_sql_literal(value)}'
+            for name, value in keys.items())
+        statements.append(f'DELETE FROM {table_sql} WHERE {where};')
+    return '\n'.join(statements)
 
 
 def default_data_dir() -> Path:
@@ -320,7 +377,12 @@ class DatabaseService:
         return self._perform(connection_id, description, lambda adapter: adapter.delete_rows(table, keys_list), database=database)
 
     def apply_grid_changes(self, connection_id, table, *, updates=(), inserts=(), deletes=(), database=None) -> QueryResult:
-        description = f"COMMIT GRID {history_table(table)}"
+        updates, inserts, deletes = list(updates or ()), list(inserts or ()), list(deletes or ())
+        connection = self._operation_connection(connection_id, database=database)
+        if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            description = grid_history_sql(connection.kind, table, updates, inserts, deletes)
+        else:
+            description = f"COMMIT GRID {history_table(table)}"
 
         def mutate(adapter):
             if adapter.connection.kind not in {"SQLite", "PostgreSQL", "MySQL", "Oracle"}:

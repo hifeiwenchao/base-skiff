@@ -184,6 +184,28 @@ def test_redis_hash_value_parses_json_and_type_changes_are_validated(qtbot):
     assert dialog.values()["value"] == '{"name": "Grace"}'
 
 
+def test_redis_new_key_dialog_builds_hash_rows_and_ttl(qtbot):
+    from baseskiff.ui.dialogs import RedisKeyDialog
+
+    dialog = RedisKeyDialog(language="en")
+    qtbot.addWidget(dialog)
+    dialog.key_edit.setText("profile")
+    dialog.type_combo.setCurrentIndex(dialog.type_combo.findData("hash"))
+    dialog.hash_rows[0][0].setText("name")
+    dialog.hash_rows[0][1].setText("Ada")
+    dialog.add_value_row_button.click()
+    dialog.hash_rows[1][0].setText("plan")
+    dialog.hash_rows[1][1].setText("pro")
+    dialog.ttl_edit.setText("3600")
+
+    assert dialog.values() == {
+        "key": "profile",
+        "type": "hash",
+        "value": {"name": "Ada", "plan": "pro"},
+        "ttl": 3600,
+    }
+
+
 def test_create_sqlite_file_initializes_a_real_database(qtbot, monkeypatch, tmp_path):
     from PySide6.QtWidgets import QFileDialog
 

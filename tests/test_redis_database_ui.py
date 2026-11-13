@@ -174,7 +174,7 @@ def test_new_key_draft_keeps_database_if_selection_changes_during_dialog(window,
             return True
         def values(self):
             return {'key': 'draft:key', 'type': 'string', 'value': 'draft in DB0'}
-    monkeypatch.setattr(window_module, 'RowDialog', DraftDialog)
+    monkeypatch.setattr(window_module, 'RedisKeyDialog', DraftDialog)
     monkeypatch.setattr(window.service, 'insert_row',
                         lambda *args, database=None: calls.append(database))
     window.add_row()

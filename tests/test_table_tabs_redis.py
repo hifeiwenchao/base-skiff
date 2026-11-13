@@ -109,7 +109,7 @@ def test_background_new_key_refreshes_origin_catalog_without_opening_key(redis_t
         def values(self):
             return {'key': 'created:background', 'type': 'string', 'value': 'new'}
 
-    monkeypatch.setattr('baseskiff.ui.window.RowDialog', NewKeyDialog)
+    monkeypatch.setattr('baseskiff.ui.window.RedisKeyDialog', NewKeyDialog)
     window.add_row()
     insertion = next(request for request in reversed(requests)
                      if getattr(request[0].func, '__name__', '') == 'insert_row')
@@ -159,7 +159,7 @@ def test_background_new_key_error_belongs_to_origin_tab(redis_tabs, monkeypatch)
     origin = window._active_workspace
     dialog = SimpleNamespace(setWindowTitle=lambda title: None, exec=lambda: True,
                              values=lambda: {'key': 'new', 'type': 'string', 'value': 'value'})
-    monkeypatch.setattr('baseskiff.ui.window.RowDialog', lambda *args, **kwargs: dialog)
+    monkeypatch.setattr('baseskiff.ui.window.RedisKeyDialog', lambda *args, **kwargs: dialog)
     window.add_row()
     insertion = next(request for request in reversed(requests)
                      if getattr(request[0].func, '__name__', '') == 'insert_row')

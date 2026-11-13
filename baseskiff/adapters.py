@@ -1128,8 +1128,9 @@ class RedisAdapter:
         key = values.get("key") or table
         kind = values.get("type") or "string"
         value = values.get("value", "")
+        ttl_seconds = values.get("ttl")
         with self.session() as client:
-            self._write_value(client, key, kind, value, insert=True)
+            self._write_value(client, key, kind, value, insert=True, ttl_seconds=ttl_seconds)
         return QueryResult(affected=1)
 
     @staticmethod
@@ -1172,7 +1173,7 @@ class RedisAdapter:
             return {scalar(field): scalar(item) for field, item in value.items()}
         return [scalar(item) for item in value]
 
-    def _write_value(self, client, key, kind, value, *, insert=False):
+    def _write_value(self, client, key, kind, value, *, insert=False, ttl_seconds=None):
         """Stage a valid value, then atomically rename it over an unchanged key.
 
         Redis MULTI does not roll back earlier commands on runtime errors. The
@@ -1181,6 +1182,10 @@ class RedisAdapter:
         """
         if not isinstance(key, (str, bytes)) or not key:
             raise ValueError("A Redis key must be a nonempty string or bytes.")
+        if ttl_seconds is not None and (
+                isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int)
+                or ttl_seconds < 1 or ttl_seconds > 2_147_483_647):
+            raise ValueError("TTL must be a positive number of seconds up to 2,147,483,647.")
         temporary = f"__baseskiff_tmp__:{uuid.uuid4().hex}"
         watch_error = driver("redis").WatchError
         try:
@@ -1215,7 +1220,9 @@ class RedisAdapter:
                         staging.zadd(temporary, value)
                     staging.pexpire(temporary, 60_000)
                     staging.execute()
-                if ttl >= 0:
+                if ttl_seconds is not None:
+                    client.expire(temporary, ttl_seconds)
+                elif ttl >= 0:
                     remaining = ttl - int((time.monotonic() - checked_at) * 1000)
                     if remaining <= 0:
                         raise ValueError("This Redis key expired while editing. Refresh the table.")

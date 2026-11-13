@@ -78,6 +78,10 @@ def test_sql_grid_changes_can_be_committed_as_one_transaction(local_service):
         {"id": 3, "name": "Chloé", "score": 10},
         {"id": 4, "name": "Dora", "score": 5},
     ]
+    history = service.list_history(connection.id, "query-controls.sqlite")[0]
+    assert 'UPDATE "people" SET "score" = 31 WHERE "id" = 1;' in history.query
+    assert 'INSERT INTO "people" ("id", "name", "score") VALUES (4, \'Dora\', 5);' in history.query
+    assert 'DELETE FROM "people" WHERE "id" = 2;' in history.query
 
 
 def test_sql_grid_changes_roll_back_as_one_transaction(local_service):

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -681,6 +682,231 @@ class RowDialog(QDialog):
             except (ValueError, TypeError, OverflowError) as error:
                 raise ValueError(self.tr("invalid_field", field=column.name, error=str(error))) from None
         return result
+
+    def accept(self) -> None:
+        try:
+            self.values()
+        except ValueError as error:
+            self.error_label.setText(str(error))
+            self.error_label.show()
+            return
+        self.error_label.hide()
+        super().accept()
+
+
+class RedisKeyDialog(QDialog):
+    """Create a Redis key with a type-aware value editor and optional TTL."""
+
+    _TYPES = (('字符串', 'String', 'string'), ('哈希', 'Hash', 'hash'),
+              ('列表', 'List', 'list'), ('集合', 'Set', 'set'),
+              ('有序集合', 'Sorted set', 'zset'))
+
+    def __init__(self, parent: QWidget | None = None, language: str = 'zh') -> None:
+        super().__init__(parent)
+        self.language = language if language in {'zh', 'en'} else 'en'
+        self.setObjectName('redisKeyDialog')
+        self.setWindowTitle(self._text('新建 key', 'New key'))
+        self.setMinimumWidth(540)
+        self.resize(620, 560)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 22)
+        layout.setSpacing(14)
+        layout.addWidget(_label(self.windowTitle(), 'dialogTitle'))
+        hint = _label(self._text('选择类型后按对应结构填写值，可选设置 TTL。',
+                                 'Choose a type, fill its structured value, and optionally set a TTL.'), 'muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setVerticalSpacing(13)
+        form.setHorizontalSpacing(22)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.key_edit = QLineEdit()
+        self.key_edit.setObjectName('redisKey')
+        self.key_edit.setMinimumHeight(34)
+        self.key_edit.setPlaceholderText(self._text('输入 key', 'Key'))
+        form.addRow(_label('key'), self.key_edit)
+
+        self.type_combo = QComboBox()
+        self.type_combo.setObjectName('redisType')
+        self.type_combo.setMinimumHeight(34)
+        for chinese, english, value in self._TYPES:
+            self.type_combo.addItem(self._text(chinese, english), value)
+        form.addRow(_label(self._text('类型', 'Type')), self.type_combo)
+
+        self.ttl_edit = QLineEdit()
+        self.ttl_edit.setObjectName('redisTTL')
+        self.ttl_edit.setMinimumHeight(34)
+        self.ttl_edit.setPlaceholderText(self._text('留空表示不过期（秒）', 'Leave empty for no expiry (seconds)'))
+        form.addRow(_label('TTL'), self.ttl_edit)
+
+        self.value_stack = QStackedWidget()
+        self.value_stack.setObjectName('redisValueStack')
+        self._pages: dict[str, QWidget] = {}
+        self._row_containers: dict[str, QVBoxLayout] = {}
+        self._rows: dict[str, list[tuple[QLineEdit, ...]]] = {}
+        self._add_buttons: dict[str, QPushButton] = {}
+        self._rows['string'] = []
+        self.hash_rows = self._rows.setdefault('hash', [])
+        self.list_rows = self._rows.setdefault('list', [])
+        self.set_rows = self._rows.setdefault('set', [])
+        self.zset_rows = self._rows.setdefault('zset', [])
+        self.add_value_row_button: QPushButton | None = None
+        self._string_value: QPlainTextEdit | None = None
+        for kind in ('string', 'hash', 'list', 'set', 'zset'):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(8)
+            rows = QVBoxLayout()
+            rows.setContentsMargins(0, 0, 0, 0)
+            rows.setSpacing(7)
+            page_layout.addLayout(rows)
+            add_button = _button(self._text('添加一行', 'Add row'))
+            add_button.setObjectName('addRedisValueRow')
+            add_button.clicked.connect(lambda _checked=False, selected=kind: self._add_row(selected))
+            page_layout.addWidget(add_button, 0, Qt.AlignmentFlag.AlignLeft)
+            self._add_buttons[kind] = add_button
+            self._pages[kind] = page
+            self._row_containers[kind] = rows
+            self.value_stack.addWidget(page)
+        form.addRow(_label(self._text('值', 'Value')), self.value_stack)
+        layout.addLayout(form)
+
+        self.error_label = _label('', 'error')
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        self.cancel_button = _button(self._text('取消', 'Cancel'))
+        self.save_button = _button(self._text('保存', 'Save'), True)
+        self.save_button.setDefault(True)
+        footer.addWidget(self.cancel_button)
+        footer.addWidget(self.save_button)
+        layout.addLayout(footer)
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button.clicked.connect(self.accept)
+        self.type_combo.currentIndexChanged.connect(self._type_changed)
+        self._type_changed()
+
+    def _text(self, chinese: str, english: str) -> str:
+        return chinese if self.language == 'zh' else english
+
+    def _type_changed(self) -> None:
+        kind = self.type_combo.currentData()
+        self.value_stack.setCurrentWidget(self._pages[kind])
+        self.add_value_row_button = self._add_buttons[kind]
+        self._clear_rows(kind)
+        if kind == 'string':
+            editor = QPlainTextEdit()
+            editor.setObjectName('redisStringValue')
+            editor.setMinimumHeight(110)
+            self._string_value = editor
+            self._row_containers[kind].addWidget(editor)
+        else:
+            self._string_value = None
+            self._add_row(kind)
+
+    def _clear_rows(self, kind: str) -> None:
+        container = self._row_containers[kind]
+        while container.count():
+            item = container.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._rows[kind].clear()
+
+    def _add_row(self, kind: str) -> None:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        fields: tuple[QLineEdit, ...]
+        if kind == 'hash':
+            field, value = QLineEdit(), QLineEdit()
+            field.setPlaceholderText(self._text('字段', 'Field'))
+            value.setPlaceholderText(self._text('值', 'Value'))
+            fields = (field, value)
+        elif kind == 'zset':
+            member, score = QLineEdit(), QLineEdit()
+            member.setPlaceholderText(self._text('成员', 'Member'))
+            score.setPlaceholderText(self._text('分数', 'Score'))
+            fields = (member, score)
+        else:
+            value = QLineEdit()
+            value.setPlaceholderText(self._text('值', 'Value'))
+            fields = (value,)
+        for field in fields:
+            field.setMinimumHeight(32)
+            row_layout.addWidget(field, 1)
+        self._row_containers[kind].addWidget(row)
+        self._rows[kind].append(fields)
+
+    def _parse_ttl(self) -> int | None:
+        text = self.ttl_edit.text().strip()
+        if not text:
+            return None
+        try:
+            ttl = int(text)
+        except ValueError:
+            raise ValueError(self._text('TTL 必须是 1 到 2,147,483,647 之间的整数秒。',
+                                        'TTL must be an integer from 1 to 2,147,483,647 seconds.')) from None
+        if ttl < 1 or ttl > 2_147_483_647 or str(ttl) != text:
+            raise ValueError(self._text('TTL 必须是 1 到 2,147,483,647 之间的整数秒。',
+                                        'TTL must be an integer from 1 to 2,147,483,647 seconds.'))
+        return ttl
+
+    def _collection_value(self, kind: str) -> Any:
+        rows = self._rows[kind]
+        if kind == 'hash':
+            result = {}
+            for field_edit, value_edit in rows:
+                field, value = field_edit.text(), value_edit.text()
+                if not field and not value:
+                    continue
+                if not field:
+                    raise ValueError(self._text('Hash 字段不能为空。', 'Hash fields cannot be empty.'))
+                if field in result:
+                    raise ValueError(self._text(f'Hash 字段“{field}”重复。', f'Duplicate Hash field: {field}.'))
+                result[field] = value
+            if not result:
+                raise ValueError(self._text('请至少填写一组 Hash 字段和值。', 'Enter at least one Hash field and value.'))
+            return result
+        if kind == 'zset':
+            result = {}
+            for member_edit, score_edit in rows:
+                member, text = member_edit.text(), score_edit.text().strip()
+                if not member and not text:
+                    continue
+                if not member:
+                    raise ValueError(self._text('ZSet 成员不能为空。', 'ZSet members cannot be empty.'))
+                try:
+                    score = float(text)
+                    if not math.isfinite(score):
+                        raise ValueError
+                except ValueError:
+                    raise ValueError(self._text('ZSet 分数必须是有限数字。', 'ZSet scores must be finite numbers.')) from None
+                if member in result:
+                    raise ValueError(self._text(f'ZSet 成员“{member}”重复。', f'Duplicate ZSet member: {member}.'))
+                result[member] = score
+            if not result:
+                raise ValueError(self._text('请至少填写一组 ZSet 成员和分数。', 'Enter at least one ZSet member and score.'))
+            return result
+        values = [fields[0].text() for fields in rows if fields[0].text()]
+        if not values:
+            raise ValueError(self._text('请至少填写一个值。', 'Enter at least one value.'))
+        if kind == 'set' and len(values) != len(set(values)):
+            raise ValueError(self._text('Set 成员不能重复。', 'Set members must be unique.'))
+        return values
+
+    def values(self) -> dict[str, Any]:
+        key = self.key_edit.text()
+        if not key:
+            raise ValueError(self._text('请输入 Redis key。', 'Enter a Redis key.'))
+        kind = self.type_combo.currentData()
+        value = self._string_value.toPlainText() if kind == 'string' else self._collection_value(kind)
+        return {'key': key, 'type': kind, 'value': value, 'ttl': self._parse_ttl()}
 
     def accept(self) -> None:
         try:
