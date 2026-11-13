@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from baseskiff.models import Connection
-from baseskiff.service import DatabaseService
+from baseskiff.service import CancellationToken, DatabaseService, QueryCancelled
 
 
 @pytest.fixture
@@ -107,6 +107,16 @@ def test_query_cap_and_durable_success_failure_history(service, local, tmp_path)
     assert all(entry.elapsed_ms >= 0 and entry.connection_name == "Workspace" for entry in history)
     service.clear_history()
     assert service.list_history() == []
+
+
+def test_cancelled_sql_execution_stops_before_opening_database(service, local):
+    token = CancellationToken()
+    token.cancel()
+    with pytest.raises(QueryCancelled):
+        service.execute(local.id, "SELECT 1", cancel_token=token)
+    history = service.list_history(local.id)
+    assert history[0].success is False
+    assert "cancel" in history[0].error.lower()
 
 
 def test_sql_console_text_is_persistent_and_scoped_by_connection_and_database(service, tmp_path):

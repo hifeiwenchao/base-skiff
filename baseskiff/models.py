@@ -88,6 +88,14 @@ class ColumnInfo:
     default: Any = None
 
 @dataclass
+class IndexInfo:
+    """An index exposed by a SQL table catalog."""
+    name: str
+    columns: tuple[str, ...] = ()
+    unique: bool = False
+    origin: str = ""
+
+@dataclass
 class QueryResult:
     columns: list[str] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)

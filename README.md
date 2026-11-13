@@ -95,6 +95,8 @@ SQL 表数据页上方提供 `WHERE` 和 `ORDER BY` 条件栏。输入 SQL 片�
 
 SQL 表支持直接编辑单元格，主键列保持只读。新增、修改和删除先保存在当前标签页的待提交区，点击「提交」才会在一个事务中写入；「撤销修改」会丢弃本地变更。提交失败时整体回滚并保留待提交内容；切换或关闭有未提交修改的标签页会先提示。没有主键的表继续只读，MongoDB 和 Redis 保持各自的编辑流程。
 
+在 SQL 数据源的表节点上右击可执行重命名、清空表、添加或删除字段、删除表，以及查看、创建和删除索引。删除表要求输入完整表名并再次确认；删除索引从索引列表选择后只需一次确认，不需要再次输入索引名。只读连接不会显示可写入的结构操作。
+
 ### MongoDB
 
 输入 **JSON 命令对象**；支持 BSON Extended JSON。命令名放在第一个字段。示例中的集合需要在连接的数据库中存在。
@@ -234,6 +236,8 @@ Identically named objects in different connections or databases have separate ta
 Drag the divider at the sidebar's right edge to resize it. The default is 240px, with a 200–560px range and at least 640px reserved for the workspace. Narrow windows may limit the available sidebar width. The last dragged width is restored on restart; resizing preserves the open data, query draft and connection state. See the [resized sidebar](docs/sidebar-resize-en.png).
 
 Use SQL in the connection's Console, JSON command objects for MongoDB (for example `{"find":"customers","filter":{}}`), and one shell-style Redis command per run (for example `GET greeting`). Displayed query rows are capped at 1,000; CSV export contains the displayed result or current page. SQL table views provide `WHERE` and `ORDER BY` fragment fields above the grid; click **Apply** or press Enter to execute, and committed conditions are reused for refresh and pagination. Semicolons, comments and multiple statements are rejected. SQL table cells are directly editable except for primary keys. Inserts, edits and deletes stay staged in the tab until **Commit**; **Revert** discards them. A failed commit rolls back the transaction and keeps the staged changes. Tables without a primary key remain read-only, while MongoDB and Redis keep their own editing workflows.
+
+Right-click an SQL table for rename, truncate, add/drop column, drop table, and index management. Dropping a table requires the exact table name followed by a second confirmation. Dropping an index uses a selection from the loaded index list and one confirmation; it never asks the user to type the full index name. Read-only connections hide write operations.
 
 Enable **SSH tunnel** in the connection dialog to use password, private-key or SSH agent authentication. The database address is reached from the SSH server. Verify the server using known_hosts or a trusted SHA256 fingerprint; unknown or changed keys are rejected. All five network databases support tunnels; SQLite uses local files. Database passwords, SSH passwords and key passphrases have separate encrypted local entries. MongoDB tunnels connect to one target without replica discovery or failover.
 

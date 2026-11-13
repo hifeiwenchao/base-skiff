@@ -16,6 +16,7 @@ from pathlib import Path
 from threading import RLock
 
 from .adapters import adapter_for, redis_database_index
+from .cancellation import CancellationToken, QueryCancelled  # noqa: F401 - public compatibility exports
 from .credentials import LocalCredentials
 from .demo import create_playground
 from .models import (
@@ -337,6 +338,65 @@ class DatabaseService:
     def get_schema(self, connection_id, table, *, database=None):
         return adapter_for(self._operation_connection(connection_id, database=database)).get_schema(table)
 
+    def list_indexes(self, connection_id, table, *, database=None):
+        return adapter_for(self._operation_connection(connection_id, database=database)).list_indexes(table)
+
+    def rename_table(self, connection_id, table, new_name, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        query = (f"RENAME TABLE {history_sql_identifier(table, connection.kind, qualified=True)} TO "
+                 f"{history_sql_identifier(new_name, connection.kind)}"
+                 if connection.kind == "MySQL" else
+                 f"ALTER TABLE {history_sql_identifier(table, connection.kind, qualified=True)} RENAME TO "
+                 f"{history_sql_identifier(new_name, connection.kind)}")
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.rename_table(table, new_name), database=database)
+
+    def truncate_table(self, connection_id, table, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        query = (f"DELETE FROM {history_sql_identifier(table, connection.kind, qualified=True)}"
+                 if connection.kind == "SQLite" else
+                 f"TRUNCATE TABLE {history_sql_identifier(table, connection.kind, qualified=True)}")
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.truncate_table(table), database=database)
+
+    def add_column(self, connection_id, table, name, data_type="TEXT", *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        query = (f"ALTER TABLE {history_sql_identifier(table, connection.kind, qualified=True)} ADD COLUMN "
+                 f"{history_sql_identifier(name, connection.kind)} {data_type}")
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.add_column(table, name, data_type), database=database)
+
+    def drop_column(self, connection_id, table, name, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        query = (f"ALTER TABLE {history_sql_identifier(table, connection.kind, qualified=True)} DROP COLUMN "
+                 f"{history_sql_identifier(name, connection.kind)}")
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.drop_column(table, name), database=database)
+
+    def drop_table(self, connection_id, table, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        query = f"DROP TABLE {history_sql_identifier(table, connection.kind, qualified=True)}"
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.drop_table(table), database=database)
+
+    def create_index(self, connection_id, table, name, columns, unique=False, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        index_sql = history_sql_identifier(name, connection.kind)
+        table_sql = history_sql_identifier(table, connection.kind, qualified=True)
+        columns_sql = ", ".join(history_sql_identifier(column, connection.kind) for column in columns)
+        query = f"CREATE {'UNIQUE ' if unique else ''}INDEX {index_sql} ON {table_sql} ({columns_sql})"
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.create_index(table, name, columns, unique), database=database)
+
+    def drop_index(self, connection_id, table, name, *, database=None):
+        connection = self._operation_connection(connection_id, database=database)
+        index_sql = history_sql_identifier(name, connection.kind)
+        table_sql = history_sql_identifier(table, connection.kind, qualified=True)
+        query = (f"DROP INDEX {index_sql} ON {table_sql}" if connection.kind == "MySQL"
+                 else f"DROP INDEX {index_sql}")
+        return self._perform(connection_id, query,
+                             lambda adapter: adapter.drop_index(table, name), database=database)
+
     def fetch_rows(self, connection_id, table, page=1, page_size=50, search="", sort_column="", descending=False,
                    where_clause="", order_by="", *, database=None):
         start = time.perf_counter()
@@ -347,18 +407,30 @@ class DatabaseService:
         result.elapsed_ms = (time.perf_counter() - start) * 1000
         return result
 
-    def _perform(self, connection_id, description, operation, *, database=None):
+    def _perform(self, connection_id, description, operation, *, database=None, cancel_token=None):
         connection = self._operation_connection(connection_id, database=database)
         start = time.perf_counter()
         result, error, success = QueryResult(), "", False
+        adapter = None
+        bound_callback = None
         try:
-            result = operation(adapter_for(connection))
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            adapter = adapter_for(connection)
+            if cancel_token is not None:
+                bound_callback = getattr(adapter, 'cancel', None)
+                if bound_callback is not None:
+                    cancel_token.bind(bound_callback)
+                cancel_token.raise_if_cancelled()
+            result = operation(adapter)
             success = True
             return result
         except Exception as exception:
             error = str(exception)
             raise
         finally:
+            if cancel_token is not None and bound_callback is not None:
+                cancel_token.unbind(bound_callback)
             elapsed = (time.perf_counter() - start) * 1000
             result.elapsed_ms = elapsed
             history_database = connection.database or (
@@ -368,8 +440,16 @@ class DatabaseService:
                            (uuid.uuid4().hex, connection_id, connection.name, description, self._now(),
                             elapsed, result.affected, int(success), error, history_database))
 
-    def execute(self, connection_id, query, *, database=None):
-        return self._perform(connection_id, query, lambda adapter: adapter.execute(query), database=database)
+    def execute(self, connection_id, query, *, database=None, cancel_token=None):
+        if cancel_token is None:
+            def operation(adapter):
+                return adapter.execute(query)
+        else:
+            def operation(adapter):
+                return adapter.execute(query, cancel_token=cancel_token)
+        return self._perform(connection_id, query,
+                             operation,
+                             database=database, cancel_token=cancel_token)
 
     def insert_row(self, connection_id, table, values, *, database=None):
         description = f"INSERT {history_table(table)} {history_value(values)}"

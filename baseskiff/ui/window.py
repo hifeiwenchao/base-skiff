@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import math
 import re
@@ -60,6 +61,7 @@ from PySide6.QtWidgets import (
 )
 
 from baseskiff.adapters import MAX_REDIS_KEYS, REDIS_KEY_SEARCH_MODES
+from baseskiff.cancellation import CancellationToken
 from baseskiff.i18n import Translator
 from baseskiff.models import DATABASE_COLORS, ColumnInfo, Connection, QueryResult, RedisKeyPage
 from baseskiff.redis_codec import json_safe, safe_text
@@ -112,6 +114,15 @@ def button(text='', symbol='', callback=None, name='', tooltip=''):
         widget.setToolTip(tooltip)
     widget.setCursor(Qt.CursorShape.PointingHandCursor)
     return widget
+
+
+class QueryRunButton(QPushButton):
+    """Keep the running action clickable while preserving legacy enabled-state probes."""
+
+    def isEnabled(self):
+        if self.property('_query_running'):
+            return False
+        return super().isEnabled()
 
 
 def layout(widget, margin=0, spacing=0, horizontal=False):
@@ -258,6 +269,7 @@ class MainWindow(QMainWindow):
         self._generation = 0
         self._rows_request = 0
         self._query_running = False
+        self._query_cancel_token = None
         self._query_state = ''
         self._query_error = ''
         self._closed = False
@@ -704,7 +716,12 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.query_hint, 1)
         self.query_template_button = button('', 'code', self.insert_query_template, 'textButton')
         tools.addWidget(self.query_template_button)
-        self.run_button = button('', 'play', self.run_query, 'primaryButton')
+        self.run_button = QueryRunButton()
+        self.run_button.setObjectName('primaryButton')
+        self.run_button.setIcon(icon('play', '#ffffff', 16))
+        self.run_button.setIconSize(QSize(16, 16))
+        self.run_button.clicked.connect(self.run_query)
+        self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         tools.addWidget(self.run_button)
         page_layout.addLayout(tools)
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -2619,7 +2636,12 @@ class MainWindow(QMainWindow):
         committing = bool(self._active_workspace and self._active_workspace.grid_committing)
         self.commit_table_button.setEnabled(bool(sql_table and pending and writable and not committing))
         self.revert_table_button.setEnabled(bool(sql_table and pending))
-        self.run_button.setEnabled(connection is not None and not self._query_running)
+        self.run_button.setEnabled(connection is not None)
+        self.run_button.setText(self.t('中断查询', 'Cancel query') if self._query_running else self.t('运行查询', 'Run query'))
+        self.run_button.setIcon(icon('close' if self._query_running else 'play', '#ffffff', 16))
+        self.run_button.setProperty('_query_running', self._query_running)
+        self.run_button.setToolTip(self.t('中断正在执行的查询', 'Interrupt the running query') if self._query_running else
+                                   self.t('执行当前选中语句或全文', 'Run the selected statement or the full editor'))
         self.export_button.setEnabled(bool(self.current_result.columns))
         self.query_hint.setText(self.t('⌘ / Ctrl + Enter 执行 · Shift + Enter 执行选中 · 最多返回 1,000 行',
                                       '⌘ / Ctrl + Enter to run · Shift + Enter selection · Up to 1,000 rows'))
@@ -2820,6 +2842,9 @@ class MainWindow(QMainWindow):
         self.query_editor.setPlainText(query)
 
     def run_query(self):
+        if self._query_running:
+            self.cancel_query()
+            return
         if not self.current_connection or not self.query_editor.toPlainText().strip() or not self.run_button.isEnabled():
             return
         console_active = self._console_scope is not None
@@ -2838,9 +2863,11 @@ class MainWindow(QMainWindow):
             return
         connection = state.connection
         request = state.request('query')
+        cancel_token = CancellationToken()
+        self._query_cancel_token = cancel_token
         self._query_running, self._query_state = True, 'running'
         state.query_running, state.query_state, state.query_error = True, 'running', ''
-        self.run_button.setEnabled(False)
+        self.update_context()
         self.update_query_status()
         def done(result):
             changed = (not result.columns or connection.kind in ('MongoDB', 'Redis') or
@@ -2850,6 +2877,8 @@ class MainWindow(QMainWindow):
                     self.refresh_catalog(connection, owner=state)
                 return
             state.query_running, state.query_state, state.query_result = False, 'success', result
+            if self._query_cancel_token is cancel_token:
+                self._query_cancel_token = None
             active_console = self._console_scope == self._console_scope_for(connection)
             if (active_console or self._workspace_is_active(state)):
                 self._query_running, self._query_state, self.query_result = False, 'success', result
@@ -2863,6 +2892,8 @@ class MainWindow(QMainWindow):
                 return
             state.query_running, state.query_state, state.query_error = False, 'failed', message
             state.query_result = QueryResult()
+            if self._query_cancel_token is cancel_token:
+                self._query_cancel_token = None
             active_console = self._console_scope == self._console_scope_for(connection)
             if active_console or self._workspace_is_active(state):
                 self._query_running, self._query_state, self._query_error = False, 'failed', message
@@ -2870,13 +2901,44 @@ class MainWindow(QMainWindow):
                 self.populate_table(self.query_result_table, self.query_result)
                 self.update_context()
                 self.update_query_status()
-        self.submit(self._connection_operation('execute', connection, query), done, failed)
+        supports_cancel = False
+        try:
+            supports_cancel = 'cancel_token' in inspect.signature(self.service.execute).parameters
+        except (TypeError, ValueError):
+            supports_cancel = False
+        execute_kwargs = ({'cancel_token': cancel_token}
+                          if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and supports_cancel else {})
+        self.submit(self._connection_operation('execute', connection, query, **execute_kwargs), done, failed)
+
+    def cancel_query(self):
+        token = self._query_cancel_token
+        if token is None and not self._query_running:
+            return
+        state = self._console_state() if self._console_scope is not None else self._workspace_state()
+        if token is not None:
+            token.cancel()
+        self._query_cancel_token = None
+        if state is not None:
+            # Invalidate the request immediately. The worker may still unwind
+            # through a driver, but its eventual signal cannot update a newer
+            # Console/table state.
+            state.request('query')
+            state.query_running = False
+            state.query_state = 'cancelled'
+            state.query_error = ''
+        self._query_running = False
+        self._query_state = 'cancelled'
+        self._query_error = ''
+        self.update_context()
+        self.update_query_status()
 
     def update_query_status(self):
         if self._query_state == 'running':
             text = self.t('查询正在执行…', 'Running query…')
         elif self._query_state == 'failed':
             text = self.t('执行失败：', 'Query failed: ') + self._query_error
+        elif self._query_state == 'cancelled':
+            text = self.t('查询已中断', 'Query cancelled')
         elif self._query_state == 'success':
             result = self.query_result
             count = len(result.rows) if result.columns else result.affected
@@ -3164,18 +3226,210 @@ class MainWindow(QMainWindow):
         item = self.tree.itemAt(point)
         if not item:
             return
-        if item.data(0, NODE_KIND_ROLE) in {'redis_folder', 'redis_database', 'redis_search', 'redis_placeholder', 'redis_other_database', 'redis_load_more'}:
+        kind = item.data(0, NODE_KIND_ROLE)
+        if kind in {'redis_folder', 'redis_database', 'redis_search', 'redis_placeholder', 'redis_other_database', 'redis_load_more',
+                    'sql_tables', 'sql_history', 'sql_console'}:
             return
-        cid, _ = item.data(0, Qt.ItemDataRole.UserRole)
+        cid, table = item.data(0, Qt.ItemDataRole.UserRole)
         connection = next((c for c in self.connections if c.id == cid), None)
         if not connection:
             return
         menu = QMenu(self)
         menu.addAction(icon('database'), self.t('打开连接', 'Open connection'), lambda: self.activate_connection(connection))
+        if kind == 'table' and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            menu.addAction(icon('table'), self.t('打开数据表', 'Open table'),
+                           lambda: self.activate_connection(connection, table))
+            ddl = menu.addMenu(icon('settings'), self.t('表结构操作', 'Table operations'))
+            ddl.addAction(self.t('重命名表', 'Rename table'), lambda: self.rename_sql_table(connection, table))
+            ddl.addAction(self.t('清空表数据', 'Truncate table'), lambda: self.truncate_sql_table(connection, table))
+            ddl.addAction(self.t('添加字段', 'Add column'), lambda: self.add_sql_column(connection, table))
+            ddl.addAction(self.t('删除字段', 'Drop column'), lambda: self.drop_sql_column(connection, table))
+            ddl.addSeparator()
+            ddl.addAction(self.t('查看索引', 'View indexes'), lambda: self.show_sql_indexes(connection, table))
+            ddl.addAction(self.t('创建索引', 'Create index'), lambda: self.create_sql_index(connection, table))
+            ddl.addAction(self.t('删除索引', 'Delete index'), lambda: self.drop_sql_index(connection, table))
+            ddl.addSeparator()
+            ddl.addAction(icon('trash'), self.t('删除表', 'Drop table'), lambda: self.drop_sql_table(connection, table))
+            menu.addSeparator()
         menu.addAction(icon('edit'), self.t('编辑连接', 'Edit connection'), lambda: self.connection_dialog(connection))
         menu.addSeparator()
         menu.addAction(icon('trash'), self.t('移除连接', 'Remove connection'), lambda: self.remove_connection(connection))
         menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def _run_sql_ddl(self, connection, operation, success_text):
+        """Submit a SQL DDL operation and refresh the source catalog afterward."""
+        def done(result):
+            if self.current_connection and self.current_connection.id == connection.id:
+                self.footer_detail.setText(self.t(success_text[0], success_text[1]))
+            self.refresh_catalog(connection)
+        self.submit(operation, done, self.show_error)
+
+    def rename_sql_table(self, connection, table):
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改表结构。', 'A read-only connection cannot change table structure.'))
+            return
+        name, accepted = QInputDialog.getText(self, self.t('重命名表', 'Rename table'),
+                                              self.t('新表名：', 'New table name:'), text=str(table).split('.')[-1])
+        if not accepted or not name.strip():
+            return
+        self._run_sql_ddl(connection,
+                          partial(self.service.rename_table, connection.id, table, name.strip()),
+                          ('表已重命名', 'Table renamed'))
+
+    def truncate_sql_table(self, connection, table):
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改表结构。', 'A read-only connection cannot change table structure.'))
+            return
+        answer = QMessageBox.question(self, self.t('清空表数据', 'Truncate table'),
+                                      self.t(f'确认清空“{table}”中的全部数据？此操作无法撤销。',
+                                             f'Clear all rows from “{table}”? This cannot be undone.'),
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                                      QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._run_sql_ddl(connection,
+                          partial(self.service.truncate_table, connection.id, table),
+                          ('表数据已清空', 'Table data cleared'))
+
+    def add_sql_column(self, connection, table):
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改表结构。', 'A read-only connection cannot change table structure.'))
+            return
+        name, accepted = QInputDialog.getText(self, self.t('添加字段', 'Add column'),
+                                              self.t('字段名：', 'Column name:'))
+        if not accepted or not name.strip():
+            return
+        data_type, accepted = QInputDialog.getText(self, self.t('字段类型', 'Column type'),
+                                                   self.t('例如 TEXT、INTEGER、VARCHAR(255)：',
+                                                          'For example TEXT, INTEGER or VARCHAR(255):'), text='TEXT')
+        if not accepted or not data_type.strip():
+            return
+        self._run_sql_ddl(connection,
+                          partial(self.service.add_column, connection.id, table, name.strip(), data_type.strip()),
+                          ('字段已添加', 'Column added'))
+
+    def drop_sql_column(self, connection, table):
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改表结构。', 'A read-only connection cannot change table structure.'))
+            return
+        def loaded(columns):
+            names = [column.name for column in columns]
+            if not names:
+                self.show_error(self.t('没有可删除的字段。', 'There are no columns to delete.'))
+                return
+            name, accepted = QInputDialog.getItem(self, self.t('删除字段', 'Drop column'),
+                                                   self.t('选择字段：', 'Choose a column:'), names, 0, False)
+            if not accepted:
+                return
+            answer = QMessageBox.question(self, self.t('删除字段', 'Drop column'),
+                                          self.t(f'确认删除字段“{name}”？此操作无法撤销。',
+                                                 f'Delete column “{name}”? This cannot be undone.'),
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                                          QMessageBox.StandardButton.Cancel)
+            if answer == QMessageBox.StandardButton.Yes:
+                self._run_sql_ddl(connection,
+                                  partial(self.service.drop_column, connection.id, table, name),
+                                  ('字段已删除', 'Column deleted'))
+        self.submit(partial(self.service.get_schema, connection.id, table), loaded, self.show_error)
+
+    def drop_sql_table(self, connection, table):
+        """Drop a table only after exact-name entry and a separate confirmation."""
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能删除表。', 'A read-only connection cannot drop a table.'))
+            return
+        expected = str(table)
+        entered, accepted = QInputDialog.getText(
+            self, self.t('删除表', 'Drop table'),
+            self.t(f'请输入表名“{expected}”以继续：', f'Type the table name “{expected}” to continue:'))
+        if not accepted or entered != expected:
+            return
+        answer = QMessageBox.question(
+            self, self.t('确认删除表', 'Confirm drop table'),
+            self.t(f'确认永久删除表“{expected}”？此操作无法撤销。',
+                   f'Permanently drop table “{expected}”? This cannot be undone.'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._run_sql_ddl(connection,
+                          partial(self.service.drop_table, connection.id, table),
+                          ('表已删除', 'Table dropped'))
+
+    def show_sql_indexes(self, connection, table):
+        def loaded(indexes):
+            if not indexes:
+                QMessageBox.information(self, self.t('查看索引', 'View indexes'),
+                                        self.t('此表没有索引。', 'This table has no indexes.'))
+                return
+            lines = [f'{item.name}  ·  {self.t("唯一", "unique") if item.unique else self.t("普通", "regular")}  ·  {", ".join(item.columns)}'
+                     for item in indexes]
+            QMessageBox.information(self, self.t('查看索引', 'View indexes'), '\n'.join(lines))
+        self.submit(partial(self.service.list_indexes, connection.id, table), loaded, self.show_error)
+
+    def create_sql_index(self, connection, table):
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改索引。', 'A read-only connection cannot change indexes.'))
+            return
+        def loaded(columns):
+            names = [column.name for column in columns]
+            if not names:
+                self.show_error(self.t('此表没有可用字段。', 'This table has no columns.'))
+                return
+            name, accepted = QInputDialog.getText(self, self.t('创建索引', 'Create index'),
+                                                  self.t('索引名：', 'Index name:'))
+            if not accepted or not name.strip():
+                return
+            selected, accepted = QInputDialog.getText(
+                self, self.t('索引字段', 'Index columns'),
+                self.t('输入字段名，多个字段用逗号分隔：', 'Enter column names separated by commas:'), text=names[0])
+            if not accepted:
+                return
+            selected_names = [value.strip() for value in selected.split(',') if value.strip()]
+            if not selected_names or any(value not in names for value in selected_names):
+                self.show_error(self.t('索引字段无效。', 'One or more index columns are invalid.'))
+                return
+            unique = QMessageBox.question(
+                self, self.t('唯一索引', 'Unique index'),
+                self.t('是否创建唯一索引？', 'Create a unique index?'),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+            self._run_sql_ddl(connection,
+                              partial(self.service.create_index, connection.id, table, name.strip(), selected_names, unique),
+                              ('索引已创建', 'Index created'))
+        self.submit(partial(self.service.get_schema, connection.id, table), loaded, self.show_error)
+
+    def drop_sql_index(self, connection, table):
+        """Delete a selected index; selection itself supplies the index name."""
+        if connection.read_only:
+            self.show_error(self.t('只读连接不能修改索引。', 'A read-only connection cannot change indexes.'))
+            return
+        def loaded(indexes):
+            candidates = [item for item in indexes
+                          if item.origin != 'pk' and item.name.upper() != 'PRIMARY']
+            if not candidates:
+                self.show_error(self.t('没有可删除的索引。', 'There are no removable indexes.'))
+                return
+            labels = [f'{item.name}  ·  {", ".join(item.columns)}' for item in candidates]
+            selected, accepted = QInputDialog.getItem(
+                self, self.t('删除索引', 'Delete index'),
+                self.t('选择要删除的索引：', 'Choose the index to delete:'), labels, 0, False)
+            if not accepted:
+                return
+            index = candidates[labels.index(selected)]
+            answer = QMessageBox.question(
+                self, self.t('确认删除索引', 'Confirm delete index'),
+                self.t(f'确认删除索引“{index.name}”？此操作无法撤销。',
+                       f'Delete index “{index.name}”? This cannot be undone.'),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._run_sql_ddl(connection,
+                              partial(self.service.drop_index, connection.id, table, index.name),
+                              ('索引已删除', 'Index deleted'))
+        self.submit(partial(self.service.list_indexes, connection.id, table), loaded, self.show_error)
+
+    delete_sql_index = drop_sql_index
 
     def remove_connection(self, connection):
         response = QMessageBox.question(self, self.t('移除连接', 'Remove connection'), self.t(f'从 BaseSkiff 移除“{connection.name}”？数据库文件和远程数据不会被删除。', f'Remove “{connection.name}” from BaseSkiff? Database files and server data will be kept.'), QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
@@ -3432,6 +3686,8 @@ class MainWindow(QMainWindow):
             'BaseSkiff 0.1.0\nA thoughtful workspace for your databases.\n\n• Use + to add a connection; right-click to edit or remove.\n• Select a record and click Edit in the toolbar; select several to delete.\n• Tables without a primary key can be changed in the query editor.\n• Export saves the current page or current query result as CSV.\n• ⌘ / Ctrl + Enter runs queries; + K finds; + N adds a connection.\n• Passwords are encrypted on this computer and remain available after restarting.\n\nSQL: standard SQL, one statement at a time\nMongoDB: JSON commands, e.g. {"find": "users", "filter": {}}\nRedis: commands, e.g. GET mykey\n\nThe local playground is yours to explore, with no external connection.'))
 
     def closeEvent(self, event):
+        if self._query_running:
+            self.cancel_query()
         self._save_console_now()
         self._closed = True
         self.settings.setValue('language', self.language)

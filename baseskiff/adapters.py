@@ -14,11 +14,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from itertools import islice
 from pathlib import Path
+from threading import RLock
 
+from .cancellation import QueryCancelled
 from .models import (
     DEFAULT_PORTS,
     ColumnInfo,
     Connection,
+    IndexInfo,
     QueryResult,
     RedisDatabaseInfo,
     RedisDatabaseList,
@@ -130,6 +133,8 @@ class SQLAdapter:
         self.endpoint = endpoint
         self.kind = connection.kind
         self.placeholder = "?" if self.kind == "SQLite" else "%s"
+        self._active_db = None
+        self._active_db_lock = RLock()
 
     def quote(self, identifier: str) -> str:
         if not identifier or "\x00" in identifier:
@@ -163,7 +168,9 @@ class SQLAdapter:
             return [f":{index + offset + 1}" for index in range(count)]
         return [self.placeholder] * count
 
-    def _open(self):
+    def _open(self, cancel_token=None):
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
         connection = self.connection
         port = connection.port or DEFAULT_PORTS.get(self.kind, 0)
         if self.kind == "SQLite":
@@ -174,7 +181,8 @@ class SQLAdapter:
                                  uri=True, timeout=10)
             db.execute("PRAGMA foreign_keys = ON")
             deadline = time.monotonic() + 10
-            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 5000)
+            db.set_progress_handler(lambda: int((cancel_token is not None and cancel_token.cancelled)
+                                                 or time.monotonic() > deadline), 5000)
             if connection.read_only:
                 db.execute("PRAGMA query_only = ON")
                 allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
@@ -229,9 +237,33 @@ class SQLAdapter:
             return db
         raise ValueError(f"Unsupported SQL database: {self.kind}")
 
+    def cancel(self):
+        with self._active_db_lock:
+            db = self._active_db
+        if db is None:
+            return
+        try:
+            if self.kind == 'SQLite':
+                db.interrupt()
+            elif self.kind in {'PostgreSQL', 'Oracle'}:
+                db.cancel()
+            else:
+                # PyMySQL has no portable query-cancel call; closing the
+                # worker's dedicated session interrupts its current command.
+                db.close()
+        except Exception:
+            # The worker will surface the original cancellation state. A
+            # driver may already have closed the session while racing cancel.
+            pass
+
     @contextmanager
-    def session(self):
-        db = self._open()
+    def session(self, cancel_token=None):
+        # Keep the no-argument hook compatible with lightweight adapters and
+        # tests that replace _open; cancellation only needs the token-aware
+        # call when a token was actually supplied.
+        db = self._open(cancel_token) if cancel_token is not None else self._open()
+        with self._active_db_lock:
+            self._active_db = db
         try:
             if self.connection.read_only and self.kind != "SQLite":
                 with db.cursor() as cursor:
@@ -248,6 +280,9 @@ class SQLAdapter:
                 pass
             raise
         finally:
+            with self._active_db_lock:
+                if self._active_db is db:
+                    self._active_db = None
             db.close()
 
     def _query(self, db, query: str, values=(), limit=MAX_ROWS):
@@ -293,7 +328,7 @@ class SQLAdapter:
         self.execute("SELECT 1 FROM dual" if self.kind == "Oracle" else "SELECT 1")
         return f"Connected to {self.kind} successfully."
 
-    def execute(self, query: str):
+    def execute(self, query: str, cancel_token=None):
         if not query.strip():
             raise ValueError("Enter a SQL statement.")
         if self.connection.read_only and self.kind != "SQLite":
@@ -301,8 +336,18 @@ class SQLAdapter:
             clean = re.sub(r"/\*.*?\*/|--[^\n]*", " ", query, flags=re.S).strip()
             if not re.match(r"^(SELECT|SHOW|DESCRIBE|DESC)\b", clean, re.I):
                 raise PermissionError("Only SELECT, SHOW and DESCRIBE are allowed on a read-only connection.")
-        with self.session() as db:
-            return self._query(db, query)
+        try:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            with self.session(cancel_token) as db:
+                result = self._query(db, query)
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            return result
+        except Exception:
+            if cancel_token is not None and cancel_token.cancelled:
+                raise QueryCancelled() from None
+            raise
 
     def list_tables(self):
         with self.session() as db:
@@ -340,6 +385,138 @@ class SQLAdapter:
             name = table.split(".", 1)[-1]
             rows = self._query(db, "SELECT c.column_name, c.data_type, c.nullable, c.data_default, CASE WHEN p.column_name IS NULL THEN 0 ELSE 1 END AS pk FROM user_tab_columns c LEFT JOIN (SELECT k.column_name, k.table_name FROM user_cons_columns k JOIN user_constraints t ON k.constraint_name=t.constraint_name WHERE t.constraint_type='P') p ON p.table_name=c.table_name AND p.column_name=c.column_name WHERE c.table_name=:1 ORDER BY c.column_id", (name,)).rows
             return [ColumnInfo(row["COLUMN_NAME"], row["DATA_TYPE"], bool(row["PK"]), row["NULLABLE"] == "Y", row["DATA_DEFAULT"]) for row in rows]
+
+    @staticmethod
+    def _row_value(row, *names, default=None):
+        for name in names:
+            if name in row:
+                return row[name]
+            if name.upper() in row:
+                return row[name.upper()]
+            if name.lower() in row:
+                return row[name.lower()]
+        return default
+
+    def list_indexes(self, table: str):
+        """Return indexes in a stable, driver-independent shape."""
+        with self.session() as db:
+            if self.kind == "SQLite":
+                indexes = []
+                rows = self._query(db, f"PRAGMA index_list({self.quote(table)})").rows
+                for row in rows:
+                    name = self._row_value(row, "name")
+                    if not name:
+                        continue
+                    columns = self._query(db, f"PRAGMA index_info({self.quote(name)})").rows
+                    indexes.append(IndexInfo(
+                        str(name),
+                        tuple(str(self._row_value(item, "name", default="")) for item in columns
+                              if self._row_value(item, "name") is not None),
+                        bool(self._row_value(row, "unique", "is_unique", default=0)),
+                        str(self._row_value(row, "origin", default="") or ""),
+                    ))
+                return indexes
+            if self.kind == "PostgreSQL":
+                schema, name = table.split(".", 1) if "." in table else ("public", table)
+                rows = self._query(db, """
+                    SELECT idx.relname AS name, i.indisunique AS is_unique,
+                           COALESCE(array_agg(att.attname ORDER BY ord.n)
+                                    FILTER (WHERE att.attname IS NOT NULL), ARRAY[]::text[]) AS columns
+                    FROM pg_class tbl
+                    JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+                    JOIN pg_index i ON i.indrelid = tbl.oid
+                    JOIN pg_class idx ON idx.oid = i.indexrelid
+                    LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY ord(attnum, n) ON TRUE
+                    LEFT JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = ord.attnum
+                    WHERE ns.nspname = %s AND tbl.relname = %s
+                    GROUP BY idx.relname, i.indisunique, i.indexrelid
+                    ORDER BY idx.relname
+                """, (schema, name)).rows
+                return [IndexInfo(str(self._row_value(row, "name")),
+                                  tuple(str(value) for value in (self._row_value(row, "columns", default=[]) or [])),
+                                  bool(self._row_value(row, "is_unique", "unique", default=False)))
+                        for row in rows]
+            if self.kind == "MySQL":
+                rows = self._query(db, f"SHOW INDEX FROM {self.table_sql(table)}").rows
+                grouped = {}
+                for row in rows:
+                    name = self._row_value(row, "Key_name", "key_name", "name")
+                    if not name:
+                        continue
+                    entry = grouped.setdefault(str(name), {
+                        "columns": [], "unique": not bool(self._row_value(row, "Non_unique", "non_unique", default=1))})
+                    column = self._row_value(row, "Column_name", "column_name")
+                    if column is not None:
+                        entry["columns"].append((self._row_value(row, "Seq_in_index", "seq_in_index", default=0), str(column)))
+                return [IndexInfo(name, tuple(column for _, column in sorted(entry["columns"])), entry["unique"])
+                        for name, entry in sorted(grouped.items())]
+            name = table.split(".", 1)[-1].upper()
+            rows = self._query(db, """
+                SELECT i.index_name AS name, i.uniqueness AS uniqueness,
+                       LISTAGG(c.column_name, ',') WITHIN GROUP (ORDER BY c.column_position) AS columns
+                FROM user_indexes i
+                LEFT JOIN user_ind_columns c ON c.index_name = i.index_name
+                WHERE i.table_name = :1
+                GROUP BY i.index_name, i.uniqueness
+                ORDER BY i.index_name
+            """, (name,)).rows
+            return [IndexInfo(str(self._row_value(row, "NAME", "name")),
+                              tuple(value for value in str(self._row_value(row, "COLUMNS", "columns", default="") or "").split(",") if value),
+                              str(self._row_value(row, "UNIQUENESS", "uniqueness", default="")) == "UNIQUE")
+                    for row in rows]
+
+    def _ddl(self, query):
+        require_writable(self.connection)
+        with self.session() as db:
+            return self._query(db, query)
+
+    def rename_table(self, table: str, new_name: str):
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("Enter a new table name.")
+        new_name = new_name.strip()
+        if "\x00" in new_name or "." in new_name:
+            raise ValueError("Enter a single table name.")
+        query = (f"RENAME TABLE {self.table_sql(table)} TO {self.quote(new_name)}"
+                 if self.kind == "MySQL" else
+                 f"ALTER TABLE {self.table_sql(table)} RENAME TO {self.quote(new_name)}")
+        return self._ddl(query)
+
+    def truncate_table(self, table: str):
+        query = f"DELETE FROM {self.table_sql(table)}" if self.kind == "SQLite" else f"TRUNCATE TABLE {self.table_sql(table)}"
+        return self._ddl(query)
+
+    def add_column(self, table: str, name: str, data_type: str = "TEXT"):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Enter a column name.")
+        if not isinstance(data_type, str) or not re.match(r"^[A-Za-z][A-Za-z0-9_() ,]*(?: NOT NULL| NULL)?$", data_type.strip(), re.I):
+            raise ValueError("Enter a valid column type.")
+        return self._ddl(f"ALTER TABLE {self.table_sql(table)} ADD COLUMN {self.quote(name.strip())} {data_type.strip()}")
+
+    def drop_column(self, table: str, name: str):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Choose a column to delete.")
+        return self._ddl(f"ALTER TABLE {self.table_sql(table)} DROP COLUMN {self.quote(name.strip())}")
+
+    def drop_table(self, table: str):
+        return self._ddl(f"DROP TABLE {self.table_sql(table)}")
+
+    def create_index(self, table: str, name: str, columns, unique=False):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Enter an index name.")
+        names = [str(column).strip() for column in (columns or ()) if str(column).strip()]
+        if not names:
+            raise ValueError("Choose at least one index column.")
+        if any("\x00" in column for column in names):
+            raise ValueError("Invalid index column.")
+        query = f"CREATE {'UNIQUE ' if unique else ''}INDEX {self.quote(name.strip())} ON {self.table_sql(table)} ({', '.join(self.quote(column) for column in names)})"
+        return self._ddl(query)
+
+    def drop_index(self, table: str, name: str):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Choose an index to delete.")
+        query = (f"DROP INDEX {self.quote(name.strip())} ON {self.table_sql(table)}"
+                 if self.kind == "MySQL" else f"DROP INDEX {self.quote(name.strip())}")
+        return self._ddl(query)
 
     def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
                    where_clause="", order_by=""):
@@ -1298,6 +1475,30 @@ class SSHAdapter:
 
     def get_schema(self, table):
         return self._run("get_schema", table)
+
+    def list_indexes(self, table):
+        return self._run("list_indexes", table)
+
+    def rename_table(self, table, new_name):
+        return self._run("rename_table", table, new_name)
+
+    def truncate_table(self, table):
+        return self._run("truncate_table", table)
+
+    def add_column(self, table, name, data_type="TEXT"):
+        return self._run("add_column", table, name, data_type)
+
+    def drop_column(self, table, name):
+        return self._run("drop_column", table, name)
+
+    def drop_table(self, table):
+        return self._run("drop_table", table)
+
+    def create_index(self, table, name, columns, unique=False):
+        return self._run("create_index", table, name, columns, unique)
+
+    def drop_index(self, table, name):
+        return self._run("drop_index", table, name)
 
     def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
                    where_clause="", order_by=""):
