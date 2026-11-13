@@ -3239,22 +3239,27 @@ class MainWindow(QMainWindow):
         if kind == 'table' and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
             menu.addAction(icon('table'), self.t('打开数据表', 'Open table'),
                            lambda: self.activate_connection(connection, table))
-            ddl = menu.addMenu(icon('settings'), self.t('表结构操作', 'Table operations'))
-            ddl.addAction(self.t('重命名表', 'Rename table'), lambda: self.rename_sql_table(connection, table))
-            ddl.addAction(self.t('清空表数据', 'Truncate table'), lambda: self.truncate_sql_table(connection, table))
-            ddl.addAction(self.t('添加字段', 'Add column'), lambda: self.add_sql_column(connection, table))
-            ddl.addAction(self.t('删除字段', 'Drop column'), lambda: self.drop_sql_column(connection, table))
-            ddl.addSeparator()
-            ddl.addAction(self.t('查看索引', 'View indexes'), lambda: self.show_sql_indexes(connection, table))
-            ddl.addAction(self.t('创建索引', 'Create index'), lambda: self.create_sql_index(connection, table))
-            ddl.addAction(self.t('删除索引', 'Delete index'), lambda: self.drop_sql_index(connection, table))
-            ddl.addSeparator()
-            ddl.addAction(icon('trash'), self.t('删除表', 'Drop table'), lambda: self.drop_sql_table(connection, table))
+            self._add_sql_table_operations(menu, connection, table)
             menu.addSeparator()
         menu.addAction(icon('edit'), self.t('编辑连接', 'Edit connection'), lambda: self.connection_dialog(connection))
         menu.addSeparator()
         menu.addAction(icon('trash'), self.t('移除连接', 'Remove connection'), lambda: self.remove_connection(connection))
         menu.exec(self.tree.viewport().mapToGlobal(point))
+
+    def _add_sql_table_operations(self, menu, connection, table):
+        """Keep all table DDL actions under the same context-menu submenu."""
+        ddl = menu.addMenu(icon('settings'), self.t('表结构操作', 'Table operations'))
+        ddl.addAction(self.t('重命名表', 'Rename table'), lambda: self.rename_sql_table(connection, table))
+        ddl.addAction(self.t('清空表数据', 'Truncate table'), lambda: self.truncate_sql_table(connection, table))
+        ddl.addAction(self.t('添加字段', 'Add column'), lambda: self.add_sql_column(connection, table))
+        ddl.addAction(self.t('删除字段', 'Drop column'), lambda: self.drop_sql_column(connection, table))
+        ddl.addSeparator()
+        ddl.addAction(self.t('查看索引', 'View indexes'), lambda: self.show_sql_indexes(connection, table))
+        ddl.addAction(self.t('创建索引', 'Create index'), lambda: self.create_sql_index(connection, table))
+        ddl.addAction(self.t('删除索引', 'Delete index'), lambda: self.drop_sql_index(connection, table))
+        ddl.addSeparator()
+        ddl.addAction(icon('trash'), self.t('删除表', 'Drop table'), lambda: self.drop_sql_table(connection, table))
+        return ddl
 
     def _run_sql_ddl(self, connection, operation, success_text):
         """Submit a SQL DDL operation and refresh the source catalog afterward."""

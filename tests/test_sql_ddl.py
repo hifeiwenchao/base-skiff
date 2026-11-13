@@ -1,7 +1,7 @@
 """SQL table context actions require explicit confirmation for destructive DDL."""
 import sqlite3
 
-from PySide6.QtWidgets import QInputDialog, QMessageBox
+from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox
 
 from baseskiff.models import Connection, IndexInfo
 from baseskiff.service import DatabaseService
@@ -65,4 +65,16 @@ def test_drop_sql_index_chooses_from_catalog_without_name_input(qtbot, tmp_path,
     window.drop_sql_index(connection, 'records')
 
     assert calls and calls[0][0][1:] == ('records', 'records_name_idx')
+    window.close()
+
+
+def test_sql_table_context_menu_groups_rename_and_drop_under_table_operations(qtbot, tmp_path, monkeypatch):
+    window = MainWindow(DatabaseService(tmp_path), language='en')
+    qtbot.addWidget(window)
+    menu = QMenu(window)
+    operations = window._add_sql_table_operations(menu, Connection('DDL', kind='SQLite'), 'customers')
+    top_level = [action.text() for action in menu.actions() if not action.isSeparator()]
+    nested = [action.text() for action in operations.actions() if not action.isSeparator()]
+    assert 'Rename table' not in top_level and 'Drop table' not in top_level
+    assert 'Rename table' in nested and 'Drop table' in nested
     window.close()
