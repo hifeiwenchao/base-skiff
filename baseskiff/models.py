@@ -22,6 +22,7 @@ class Connection:
     ssl: bool = False
     read_only: bool = False
     is_demo: bool = False
+    query_timeout: float = 10.0
     redis_separator: str = ":"
     ssh_enabled: bool = False
     ssh_host: str = ""
@@ -103,6 +104,9 @@ class QueryResult:
     elapsed_ms: float = 0
     total: int = 0
     truncated: bool = False
+    total_known: bool = True
+    has_more: bool = False
+    next_cursor: Any = None
 
 @dataclass
 class HistoryEntry:

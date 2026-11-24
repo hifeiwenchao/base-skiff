@@ -31,6 +31,7 @@ def main():
     temporary = tempfile.TemporaryDirectory(prefix='baseskiff-smoke-') if args.smoke_test or args.screenshot else None
     try:
         service = DatabaseService(args.data_dir or (temporary.name if temporary else None))
+        service.ephemeral = bool(args.smoke_test or args.screenshot)
         window = MainWindow(service, language=args.language)
         window.show()
         if args.smoke_test or args.screenshot:

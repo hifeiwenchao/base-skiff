@@ -266,3 +266,7 @@ Individual Hash, Set and ZSet mutations and List edits/appends remain available 
 Queued reads, writes and commands stay bound to the DB where they started. Identical key names and pending write locks are separate across DBs, and late results from an earlier DB do not replace the current view. Redis history records the DB index; double-clicking reopens a query in its original database.
 
 With TLS enabled, MySQL validates system certificate trust and the hostname. PostgreSQL uses `sslmode=require` for encrypted transport without server certificate identity verification.
+
+### 工作台效率优化
+
+SQL 表默认先显示数据、按需统计总数；Console 提供缓存补全、格式化、当前语句、多个命名工作区和 SQL 文件；表右键提供统一结构编辑及 SQL 预览。全量 SQL CSV 导出在后台分批运行并支持取消，重启恢复打开的对象与筛选状态。连接可配置查询超时。使用方式与当前限制见 [工作台优化说明](docs/WORKBENCH_OPTIMIZATION.md)。

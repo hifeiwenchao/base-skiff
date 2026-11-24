@@ -4,6 +4,7 @@ Every operation opens and closes its own database handle. No Qt or database
 connection object crosses a worker boundary.
 """
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -145,6 +146,11 @@ class DatabaseService:
                     content TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (connection_id, database));
+                CREATE TABLE IF NOT EXISTS sql_console_documents (
+                    connection_id TEXT NOT NULL, database TEXT NOT NULL,
+                    document_id TEXT NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (connection_id, database, document_id));
                 CREATE TABLE IF NOT EXISTS redis_searches (
                     id TEXT PRIMARY KEY,
                     connection_id TEXT NOT NULL,
@@ -232,6 +238,13 @@ class DatabaseService:
             raise ValueError("Choose a SQLite database file.")
         if connection.port and not 1 <= int(connection.port) <= 65535:
             raise ValueError("Port must be between 1 and 65535.")
+        try:
+            timeout = float(connection.query_timeout)
+        except (TypeError, ValueError):
+            raise ValueError("Query timeout must be a positive number of seconds.") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Query timeout must be a positive number of seconds.")
+        connection = replace(connection, query_timeout=timeout)
         validate_ssh(connection)
         connection = replace(connection, name=connection.name.strip())
         payload = connection_payload(connection)
@@ -259,6 +272,7 @@ class DatabaseService:
             db.execute("DELETE FROM connections WHERE id=?", (connection_id,))
             db.execute("DELETE FROM redis_searches WHERE connection_id=?", (connection_id,))
             db.execute("DELETE FROM sql_consoles WHERE connection_id=?", (connection_id,))
+            db.execute("DELETE FROM sql_console_documents WHERE connection_id=?", (connection_id,))
             for field in SECRET_FIELDS:
                 db.execute('DELETE FROM credentials WHERE key=?', (secret_key(connection_id, field),))
 
@@ -398,14 +412,56 @@ class DatabaseService:
                              lambda adapter: adapter.drop_index(table, name), database=database)
 
     def fetch_rows(self, connection_id, table, page=1, page_size=50, search="", sort_column="", descending=False,
-                   where_clause="", order_by="", *, database=None):
+                   where_clause="", order_by="", *, database=None, count_total=True, after_key=None,
+                   cancel_token=None):
         start = time.perf_counter()
-        result = adapter_for(self._operation_connection(connection_id, database=database)).fetch_rows(
-            table, page=page, page_size=page_size, search=search,
-            sort_column=sort_column, descending=descending,
-            where_clause=where_clause, order_by=order_by)
-        result.elapsed_ms = (time.perf_counter() - start) * 1000
-        return result
+        connection = self._operation_connection(connection_id, database=database)
+        adapter = adapter_for(connection)
+        options = {}
+        if connection.kind in {"PostgreSQL", "MySQL", "SQLite", "Oracle"}:
+            if count_total == "exact":
+                options["count_total"] = "exact"
+            elif not count_total:
+                options["count_total"] = False
+            if after_key is not None:
+                options["after_key"] = after_key
+            if cancel_token is not None:
+                options["cancel_token"] = cancel_token
+        callback = getattr(adapter, "cancel", None)
+        try:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+                if callback is not None:
+                    cancel_token.bind(callback)
+            result = adapter.fetch_rows(
+                table, page=page, page_size=page_size, search=search,
+                sort_column=sort_column, descending=descending,
+                where_clause=where_clause, order_by=order_by, **options)
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            result.elapsed_ms = (time.perf_counter() - start) * 1000
+            return result
+        except Exception:
+            if cancel_token is not None and cancel_token.cancelled:
+                raise QueryCancelled() from None
+            raise
+        finally:
+            if cancel_token is not None and callback is not None:
+                cancel_token.unbind(callback)
+
+    def export_csv(self, connection_id, destination, *, table=None, query=None, search="",
+                   sort_column="", descending=False, where_clause="", order_by="",
+                   database=None, cancel_token=None, progress=None, batch_size=500):
+        connection = self._operation_connection(connection_id, database=database)
+        if connection.kind not in {"SQLite", "PostgreSQL", "MySQL", "Oracle"}:
+            raise ValueError("Full CSV export currently supports SQL connections.")
+        return self._perform(
+            connection_id, f"EXPORT CSV {table if table is not None else query}",
+            lambda adapter: adapter.export_csv(
+                destination, table=table, query=query, search=search, sort_column=sort_column,
+                descending=descending, where_clause=where_clause, order_by=order_by,
+                cancel_token=cancel_token, progress=progress, batch_size=batch_size),
+            database=database, cancel_token=cancel_token)
 
     def _perform(self, connection_id, description, operation, *, database=None, cancel_token=None):
         connection = self._operation_connection(connection_id, database=database)
@@ -449,6 +505,14 @@ class DatabaseService:
                 return adapter.execute(query, cancel_token=cancel_token)
         return self._perform(connection_id, query,
                              operation,
+                             database=database, cancel_token=cancel_token)
+
+    def explain(self, connection_id, query, *, database=None, cancel_token=None):
+        connection = self._operation_connection(connection_id, database=database)
+        if connection.kind not in {"SQLite", "PostgreSQL", "MySQL", "Oracle"}:
+            raise ValueError("Execution plans currently support SQL connections.")
+        return self._perform(connection_id, f"EXPLAIN {query}",
+                             lambda adapter: adapter.explain(query, cancel_token=cancel_token),
                              database=database, cancel_token=cancel_token)
 
     def insert_row(self, connection_id, table, values, *, database=None):
@@ -512,6 +576,26 @@ class DatabaseService:
                        content=excluded.content, updated_at=excluded.updated_at""",
                 (connection_id, database, content, self._now()),
             )
+
+    def list_console_documents(self, connection_id, database):
+        with self._metadata() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT document_id, name, content FROM sql_console_documents WHERE connection_id=? AND database=? ORDER BY updated_at, document_id",
+                (str(connection_id), str(database)))]
+
+    def save_console_document(self, connection_id, database, document_id, name, content):
+        if not all(isinstance(value, str) for value in (document_id, name, content)) or not document_id or not name.strip():
+            raise ValueError("Console id, name and content must be text.")
+        with self._metadata() as db:
+            db.execute("""INSERT INTO sql_console_documents VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(connection_id, database, document_id) DO UPDATE SET
+                       name=excluded.name, content=excluded.content, updated_at=excluded.updated_at""",
+                       (str(connection_id), str(database), document_id, name, content, self._now()))
+
+    def delete_console_document(self, connection_id, database, document_id):
+        with self._metadata() as db:
+            db.execute("DELETE FROM sql_console_documents WHERE connection_id=? AND database=? AND document_id=?",
+                       (str(connection_id), str(database), str(document_id)))
 
     def count_history(self):
         """Count the displayed history without loading full query/error bodies."""

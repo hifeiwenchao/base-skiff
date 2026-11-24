@@ -20,6 +20,7 @@ class CancellationToken:
         self._event = Event()
         self._lock = RLock()
         self._callback = None
+        self._committing = False
 
     @property
     def cancelled(self):
@@ -41,9 +42,21 @@ class CancellationToken:
             if self._callback is callback:
                 self._callback = None
 
-    def cancel(self):
-        self._event.set()
+    def cancel(self, dispatch=None):
         with self._lock:
+            if self._committing:
+                return False
+            self._event.set()
             callback = self._callback
         if callback is not None:
-            callback()
+            if dispatch is None:
+                callback()
+            else:
+                dispatch(callback)
+        return True
+
+    def begin_commit(self):
+        """Commit is a point of no return; never misreport committed writes as cancelled."""
+        with self._lock:
+            self.raise_if_cancelled()
+            self._committing = True

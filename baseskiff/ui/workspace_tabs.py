@@ -30,9 +30,14 @@ class WorkspaceTab:
     pending_inserts: list = field(default_factory=list)
     pending_deletes: list = field(default_factory=list)
     grid_committing: bool = False
+    console_name: str = ''
     query_text: str = ''
     query_cursor: tuple = (0, 0)
     query_running: bool = False
+    query_cancel_token: Any = None
+    page_cursors: dict = field(default_factory=dict)
+    pagination_signature: Any = None
+    count_total: bool = False
     query_state: str = ''
     query_error: str = ''
     inner_tab: int = 0

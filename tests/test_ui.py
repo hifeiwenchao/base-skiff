@@ -69,7 +69,8 @@ def test_language_switch_does_not_allow_parallel_query_execution(qtbot, tmp_path
         window.run_query()
         qtbot.waitUntil(started.is_set)
         window.toggle_language()
-        assert not window.run_button.isEnabled()
+        assert window.run_button.isEnabled()
+        assert window.run_button.text() == '中断查询'
         window.run_query()
         assert len(calls) == 1
     finally:

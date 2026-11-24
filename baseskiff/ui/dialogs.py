@@ -141,6 +141,10 @@ class ConnectionDialog(QDialog):
         path_layout.addWidget(self.create_file_button)
         self.group_edit = QLineEdit(self._original.group)
         self.group_edit.setPlaceholderText("Local")
+        self.timeout_spin = PortSpinBox()
+        self.timeout_spin.setRange(1, 86400)
+        self.timeout_spin.setValue(max(1, round(self._original.query_timeout)))
+        self.timeout_spin.setSuffix(" 秒" if language == 'zh' else " s")
         self.ssl_check = QCheckBox(self.tr("ssl"))
         self.ssl_check.setChecked(self._original.ssl)
         self.read_only_check = QCheckBox(self.tr("read_only"))
@@ -166,6 +170,7 @@ class ConnectionDialog(QDialog):
                             ("group", self.group_edit)):
             self.form.addRow(_label(self.tr(key)), widget)
         self.form.addRow("", self.ssl_check)
+        self.form.addRow(_label("查询超时" if language == 'zh' else "Query timeout"), self.timeout_spin)
         self.form.addRow("", self.read_only_check)
         self.database_ssh_hint = _label(self.tr("ssh_database_hint"), "muted")
         self.database_ssh_hint.setWordWrap(True)
@@ -386,6 +391,7 @@ class ConnectionDialog(QDialog):
                        path=self.path_edit.text().strip(), group=self.group_edit.text().strip() or "Local",
                        ssl=self.ssl_check.isChecked() if kind != "SQLite" else False,
                        read_only=self.read_only_check.isChecked(),
+                       query_timeout=self.timeout_spin.value(),
                        ssh_enabled=self.ssh_enabled_check.isChecked() and kind != "SQLite",
                        ssh_host=self.ssh_host_edit.text().strip(), ssh_port=self.ssh_port_spin.value(),
                        ssh_username=self.ssh_username_edit.text().strip(),

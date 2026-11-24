@@ -28,4 +28,5 @@ def test_deleting_last_page_returns_to_a_valid_page(qtbot, monkeypatch, tmp_path
     assert not errors
     assert window.page == 2
     assert window.data_table.rowCount() == 50
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: QMessageBox.StandardButton.Discard)
     window.close()

@@ -1,15 +1,19 @@
 """Real database adapters. Optional network drivers are imported only on use."""
+import csv
 import importlib
 import json
 import math
+import os
 import re
 import shlex
 import socket
 import sqlite3
 import ssl
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from itertools import islice
@@ -168,19 +172,26 @@ class SQLAdapter:
             return [f":{index + offset + 1}" for index in range(count)]
         return [self.placeholder] * count
 
+    def _timeout(self):
+        value = float(self.connection.query_timeout)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Query timeout must be a positive number of seconds.")
+        return value
+
     def _open(self, cancel_token=None):
         if cancel_token is not None:
             cancel_token.raise_if_cancelled()
         connection = self.connection
+        timeout = self._timeout()
         port = connection.port or DEFAULT_PORTS.get(self.kind, 0)
         if self.kind == "SQLite":
             path = Path(connection.path or connection.database).expanduser().resolve()
             if not path.is_file():
                 raise FileNotFoundError(f"SQLite database does not exist: {path}")
             db = sqlite3.connect(path.as_uri() + ("?mode=ro" if connection.read_only else "?mode=rw"),
-                                 uri=True, timeout=10)
+                                 uri=True, timeout=timeout)
             db.execute("PRAGMA foreign_keys = ON")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + timeout
             db.set_progress_handler(lambda: int((cancel_token is not None and cancel_token.cancelled)
                                                  or time.monotonic() > deadline), 5000)
             if connection.read_only:
@@ -203,12 +214,12 @@ class SQLAdapter:
                 host=connection.host, port=self.endpoint.port if self.endpoint else port,
                 dbname=connection.database, user=connection.username,
                 password=connection.password, connect_timeout=8,
-                sslmode="require" if connection.ssl else "prefer", options="-c statement_timeout=10000", **route)
+                sslmode="require" if connection.ssl else "prefer", options=f"-c statement_timeout={max(1, int(timeout * 1000))}", **route)
         if self.kind == "MySQL":
             route = {"defer_connect": True} if self.endpoint else {}
             db = driver("pymysql", "PyMySQL").connect(
                 host=connection.host, port=port, database=connection.database, user=connection.username,
-                password=connection.password, connect_timeout=8, read_timeout=10, write_timeout=10,
+                password=connection.password, connect_timeout=8, read_timeout=timeout, write_timeout=timeout,
                 charset="utf8mb4", autocommit=False,
                 ssl=ssl.create_default_context() if connection.ssl else None, **route)
             if self.endpoint:
@@ -233,7 +244,7 @@ class SQLAdapter:
                 route = {"https_proxy": self.endpoint.host, "https_proxy_port": self.endpoint.proxy_port}
             db = module.connect(user=connection.username, password=connection.password, dsn=dsn,
                                 tcp_connect_timeout=8, **route)
-            db.call_timeout = 10000
+            db.call_timeout = max(1, int(timeout * 1000))
             return db
         raise ValueError(f"Unsupported SQL database: {self.kind}")
 
@@ -265,10 +276,14 @@ class SQLAdapter:
         with self._active_db_lock:
             self._active_db = db
         try:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
             if self.connection.read_only and self.kind != "SQLite":
                 with db.cursor() as cursor:
                     cursor.execute("SET TRANSACTION READ ONLY" if self.kind != "MySQL" else "START TRANSACTION READ ONLY")
             yield db
+            if cancel_token is not None:
+                cancel_token.begin_commit()
             db.commit()
         except BaseException:
             # A timed-out MySQL socket may already be closed. Never let a
@@ -349,13 +364,67 @@ class SQLAdapter:
                 raise QueryCancelled() from None
             raise
 
+    def _select_statement(self, query):
+        from .sql_editor import tokens
+        query = query.strip()
+        lexed = tokens(query)
+        # MySQL/MariaDB executable comments are SQL, not inert annotations.
+        # The shared editor lexer deliberately treats them as ordinary comments.
+        if any(token.kind == "comment" and re.match(r"^/\*(?:!|m!)", token.text, re.I)
+               for token in lexed):
+            raise ValueError("Executable SQL comments are not allowed here.")
+        if self.kind == "MySQL":
+            # SQL modes change backslash quoting; MySQL also requires ASCII
+            # whitespace after -- and does not support nested block comments,
+            # PostgreSQL dollar strings, or bracket-quoted identifiers. Reject
+            # these ambiguous forms rather than validate with another dialect.
+            ambiguous = "\\" in query or any(
+                (token.kind == "comment" and token.text.startswith("--")
+                 and len(token.text) > 2 and ord(token.text[2]) > 32)
+                or (token.kind == "comment" and token.text.startswith("/*")
+                    and token.text.count("/*") > 1)
+                or (token.kind == "string" and token.text.startswith("$"))
+                or (token.kind == "identifier" and token.text.startswith("["))
+                for token in lexed)
+            if ambiguous:
+                raise ValueError("This SELECT uses quoting or comments that cannot be safely validated for MySQL.")
+        significant = [token for token in lexed if token.kind not in {"space", "comment"}]
+        if significant and significant[-1].text == ";":
+            query = query[:significant[-1].start].rstrip()
+            significant.pop()
+        if (not significant or significant[0].text.upper() != "SELECT"
+                or any(token.kind == "symbol" and token.text == ";" for token in significant)
+                or any(token.kind == "word" and token.text.upper() == "INTO" for token in significant)):
+            raise ValueError("Choose a single SELECT statement.")
+        return query
+
+    def explain(self, query, cancel_token=None):
+        if self.kind == "Oracle":
+            raise ValueError("Oracle execution plans are not supported without writing a plan table.")
+        query = self._select_statement(query)
+        prefix = "EXPLAIN QUERY PLAN " if self.kind == "SQLite" else "EXPLAIN "
+        original = self.connection
+        try:
+            self.connection = replace(original, read_only=True)
+            with self.session(cancel_token) as db:
+                return self._query(db, prefix + query)
+        except Exception:
+            if cancel_token is not None and cancel_token.cancelled:
+                raise QueryCancelled() from None
+            raise
+        finally:
+            self.connection = original
+
     def list_tables(self):
         with self.session() as db:
             if self.kind == "SQLite":
                 rows = self._query(db, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name").rows
                 result = []
                 for row in rows:
-                    count = self._query(db, f"SELECT COUNT(*) AS n FROM {self.quote(row['name'])}").rows[0]["n"]
+                    # User databases may contain very large tables or costly
+                    # views. Catalog discovery must not scan their contents.
+                    count = (self._query(db, f"SELECT COUNT(*) AS n FROM {self.quote(row['name'])}").rows[0]["n"]
+                             if self.connection.is_demo else None)
                     result.append(TableInfo(row["name"], row_count=count, kind=row["type"]))
                 return result
             if self.kind == "PostgreSQL":
@@ -420,6 +489,10 @@ class SQLAdapter:
                 schema, name = table.split(".", 1) if "." in table else ("public", table)
                 rows = self._query(db, """
                     SELECT idx.relname AS name, i.indisunique AS is_unique,
+                           CASE WHEN i.indisprimary THEN 'pk'
+                                WHEN EXISTS (SELECT 1 FROM pg_constraint con
+                                             WHERE con.conindid = i.indexrelid AND con.contype IN ('u','p'))
+                                THEN 'u' ELSE '' END AS origin,
                            COALESCE(array_agg(att.attname ORDER BY ord.n)
                                     FILTER (WHERE att.attname IS NOT NULL), ARRAY[]::text[]) AS columns
                     FROM pg_class tbl
@@ -429,12 +502,13 @@ class SQLAdapter:
                     LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY ord(attnum, n) ON TRUE
                     LEFT JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = ord.attnum
                     WHERE ns.nspname = %s AND tbl.relname = %s
-                    GROUP BY idx.relname, i.indisunique, i.indexrelid
+                    GROUP BY idx.relname, i.indisunique, i.indisprimary, i.indexrelid
                     ORDER BY idx.relname
                 """, (schema, name)).rows
                 return [IndexInfo(str(self._row_value(row, "name")),
                                   tuple(str(value) for value in (self._row_value(row, "columns", default=[]) or [])),
-                                  bool(self._row_value(row, "is_unique", "unique", default=False)))
+                                  bool(self._row_value(row, "is_unique", "unique", default=False)),
+                                  str(self._row_value(row, "origin", default="") or ""))
                         for row in rows]
             if self.kind == "MySQL":
                 rows = self._query(db, f"SHOW INDEX FROM {self.table_sql(table)}").rows
@@ -448,11 +522,15 @@ class SQLAdapter:
                     column = self._row_value(row, "Column_name", "column_name")
                     if column is not None:
                         entry["columns"].append((self._row_value(row, "Seq_in_index", "seq_in_index", default=0), str(column)))
-                return [IndexInfo(name, tuple(column for _, column in sorted(entry["columns"])), entry["unique"])
+                return [IndexInfo(name, tuple(column for _, column in sorted(entry["columns"])), entry["unique"],
+                                  "pk" if name.upper() == "PRIMARY" else "")
                         for name, entry in sorted(grouped.items())]
             name = table.split(".", 1)[-1].upper()
             rows = self._query(db, """
                 SELECT i.index_name AS name, i.uniqueness AS uniqueness,
+                       (SELECT MAX(CASE WHEN con.constraint_type = 'P' THEN 'pk' ELSE 'u' END)
+                        FROM user_constraints con WHERE con.index_name = i.index_name
+                        AND con.constraint_type IN ('P', 'U')) AS origin,
                        LISTAGG(c.column_name, ',') WITHIN GROUP (ORDER BY c.column_position) AS columns
                 FROM user_indexes i
                 LEFT JOIN user_ind_columns c ON c.index_name = i.index_name
@@ -462,7 +540,8 @@ class SQLAdapter:
             """, (name,)).rows
             return [IndexInfo(str(self._row_value(row, "NAME", "name")),
                               tuple(value for value in str(self._row_value(row, "COLUMNS", "columns", default="") or "").split(",") if value),
-                              str(self._row_value(row, "UNIQUENESS", "uniqueness", default="")) == "UNIQUE")
+                              str(self._row_value(row, "UNIQUENESS", "uniqueness", default="")) == "UNIQUE",
+                              str(self._row_value(row, "ORIGIN", "origin", default="") or ""))
                     for row in rows]
 
     def _ddl(self, query):
@@ -518,15 +597,14 @@ class SQLAdapter:
                  if self.kind == "MySQL" else f"DROP INDEX {self.quote(name.strip())}")
         return self._ddl(query)
 
-    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
-                   where_clause="", order_by=""):
+    def _table_selection(self, table, search="", sort_column="", descending=False,
+                         where_clause="", order_by=""):
         columns = self.get_schema(table)
         names = [column.name for column in columns]
         if sort_column and sort_column not in names:
             raise ValueError("Unknown sort column.")
         custom_where = self._custom_fragment(where_clause, "WHERE", "WHERE")
         custom_order = self._custom_fragment(order_by, "ORDER BY", "ORDER BY")
-        page, page_size = max(1, int(page)), max(1, min(MAX_ROWS, int(page_size)))
         conditions, values = [], []
         if search:
             escaped = search.replace("!", "!!").replace("%", "!%").replace("_", "!_")
@@ -550,13 +628,20 @@ class SQLAdapter:
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         selected = sort_column or next((column.name for column in columns if column.primary_key), names[0] if names else "")
         order = f" ORDER BY {custom_order}" if custom_order else (f" ORDER BY {self.quote(selected)} {'DESC' if descending else 'ASC'}" if selected else "")
-        with self.session() as db:
-            count = None
-            if self.kind == "MySQL" and not where:
-                # InnoDB COUNT(*) scans the complete table. On large remote
-                # tables that can exceed the socket timeout before the first
-                # page is even read. TABLE_ROWS is the same estimate already
-                # used by the sidebar catalog and returns immediately.
+        return columns, where, order, values
+
+    def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
+                   where_clause="", order_by="", *, count_total=True, after_key=None, cancel_token=None):
+        columns, where, order, values = self._table_selection(
+            table, search, sort_column, descending, where_clause, order_by)
+        page, page_size = max(1, int(page)), max(1, min(MAX_ROWS, int(page_size)))
+        primary = [column for column in columns if column.primary_key]
+        # Only the unambiguous default single-key order can use an opaque key.
+        keyset = len(primary) == 1 and not sort_column and not order_by.strip() and not descending
+        cursor_key = primary[0].name if keyset else None
+        with (self.session(cancel_token) if cancel_token is not None else self.session()) as db:
+            count, exact_count = None, bool(count_total)
+            if count_total and count_total != "exact" and self.kind == "MySQL" and not where:
                 estimate = self._query(
                     db,
                     "SELECT TABLE_ROWS AS count_rows FROM information_schema.TABLES "
@@ -565,19 +650,125 @@ class SQLAdapter:
                 ).rows
                 if estimate and estimate[0].get("count_rows") is not None:
                     count = int(estimate[0]["count_rows"])
-            if count is None:
+                    exact_count = False
+            if count_total and count is None:
                 total = self._query(db, f"SELECT COUNT(*) AS count_rows FROM {self.table_sql(table)}{where}", values).rows[0]
-                count = next(iter(total.values()))
-            binds = self.binds(2, len(values))
+                count = int(next(iter(total.values())))
+            use_cursor = keyset and after_key is not None
+            if use_cursor:
+                where += (" AND " if where else " WHERE ") + f"{self.quote(cursor_key)} > {self.binds(1, len(values))[0]}"
+                values = values + [after_key]
+            # Fetch a lookahead row even for estimated totals. Never infer next
+            # page availability from a catalog estimate.
+            limit = page_size + 1
+            offset = 0 if use_cursor else (page - 1) * page_size
+            binds = self.binds(1 if use_cursor else 2, len(values))
             if self.kind == "Oracle":
-                suffix = f" OFFSET {binds[0]} ROWS FETCH NEXT {binds[1]} ROWS ONLY"
-                pagination = [(page - 1) * page_size, page_size]
+                suffix = (f" FETCH FIRST {binds[0]} ROWS ONLY" if use_cursor else
+                          f" OFFSET {binds[0]} ROWS FETCH NEXT {binds[1]} ROWS ONLY")
+                pagination = [limit] if use_cursor else [offset, limit]
             else:
-                suffix = f" LIMIT {binds[0]} OFFSET {binds[1]}"
-                pagination = [page_size, (page - 1) * page_size]
-            result = self._query(db, f"SELECT * FROM {self.table_sql(table)}{where}{order}{suffix}", values + pagination)
-            result.total = int(count)
+                suffix = f" LIMIT {binds[0]}" + ("" if use_cursor else f" OFFSET {binds[1]}")
+                pagination = [limit] if use_cursor else [limit, offset]
+            result = self._query(db, f"SELECT * FROM {self.table_sql(table)}{where}{order}{suffix}",
+                                 values + pagination, limit=limit)
+            result.has_more = len(result.rows) > page_size
+            result.rows = result.rows[:page_size]
+            result.affected = len(result.rows)
+            result.truncated = False
+            result.total = count if count is not None else (page - 1) * page_size + len(result.rows)
+            result.total_known = exact_count
+            result.next_cursor = result.rows[-1][cursor_key] if keyset and result.rows else None
             return result
+
+    def export_csv(self, destination, *, table=None, query=None, search="", sort_column="",
+                   descending=False, where_clause="", order_by="", cancel_token=None,
+                   progress=None, batch_size=500):
+        """Stream a consistent read-only SQL result to an atomically replaced CSV.
+
+        Named PostgreSQL cursors and PyMySQL SSCursor avoid driver-side result
+        buffering; SQLite and Oracle cursors fetch incrementally by default.
+        """
+        if (table is None) == (query is None):
+            raise ValueError("Choose exactly one table or SELECT query to export.")
+        values = []
+        if table is not None:
+            _columns, where, order, values = self._table_selection(
+                table, search, sort_column, descending, where_clause, order_by)
+            query = f"SELECT * FROM {self.table_sql(table)}{where}{order}"
+        else:
+            query = self._select_statement(query)
+            # Driver single-statement enforcement plus read-only transactions
+            # are the security boundary, including SELECT functions/CTEs.
+        batch_size = max(1, min(5000, int(batch_size)))
+        destination = Path(destination).expanduser().resolve()
+        temp_path = None
+        count = 0
+        start = time.perf_counter()
+        callback = self.cancel
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+            cancel_token.bind(callback)
+        original = self.connection
+        try:
+            self.connection = replace(original, read_only=True)
+            with self.session(cancel_token) as db:
+                if self.kind == "PostgreSQL":
+                    cursor = db.cursor(name=f"baseskiff_export_{uuid.uuid4().hex}")
+                elif self.kind == "MySQL":
+                    cursor = db.cursor(driver("pymysql", "PyMySQL").cursors.SSCursor)
+                else:
+                    cursor = db.cursor()
+                try:
+                    if self.kind == "Oracle":
+                        module = driver("oracledb")
+                        def exact_numbers(cur, metadata):
+                            if metadata.type_code == module.DB_TYPE_NUMBER:
+                                return cur.var(str, arraysize=cur.arraysize, outconverter=Decimal)
+                        cursor.outputtypehandler = exact_numbers
+                    cursor.arraysize = batch_size
+                    cursor.execute(query, tuple(values)) if values else cursor.execute(query)
+                    if not cursor.description:
+                        raise ValueError("The SELECT query did not return rows.")
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="",
+                                                     dir=destination.parent, prefix=f".{destination.name}.",
+                                                     suffix=".tmp", delete=False) as stream:
+                        temp_path = Path(stream.name)
+                        writer = csv.writer(stream)
+                        writer.writerow([column[0] for column in cursor.description])
+                        while True:
+                            if cancel_token is not None:
+                                cancel_token.raise_if_cancelled()
+                            batch = cursor.fetchmany(batch_size)
+                            if not batch:
+                                break
+                            if self.kind == "Oracle":
+                                lob_type = module.LOB
+                                batch = [[value.read() if isinstance(value, lob_type) else value
+                                          for value in row] for row in batch]
+                            writer.writerows(batch)
+                            count += len(batch)
+                            if progress is not None:
+                                progress(count)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                finally:
+                    cursor.close()
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            os.replace(temp_path, destination)
+            temp_path = None
+            return QueryResult(affected=count, total=count, elapsed_ms=(time.perf_counter() - start) * 1000)
+        except Exception:
+            if cancel_token is not None and cancel_token.cancelled:
+                raise QueryCancelled() from None
+            raise
+        finally:
+            self.connection = original
+            if cancel_token is not None:
+                cancel_token.unbind(callback)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def apply_grid_changes(self, table, *, updates=(), inserts=(), deletes=()):
         """Apply staged SQL grid edits atomically in one database transaction."""
@@ -716,7 +907,7 @@ class MongoAdapter:
             host=self.endpoint.host if self.endpoint else c.host,
             port=self.endpoint.port if self.endpoint else c.port or 27017, username=c.username or None,
             password=c.password or None, tls=c.ssl, serverSelectionTimeoutMS=8000,
-            connectTimeoutMS=8000, socketTimeoutMS=10000, **route)
+            connectTimeoutMS=8000, socketTimeoutMS=max(1, int(c.query_timeout * 1000)), **route)
         try:
             yield client[c.database or "test"]
         finally:
@@ -729,12 +920,12 @@ class MongoAdapter:
 
     def list_tables(self):
         with self.session() as db:
-            return [TableInfo(name, row_count=db[name].estimated_document_count(maxTimeMS=10000), kind="collection")
+            return [TableInfo(name, row_count=db[name].estimated_document_count(maxTimeMS=max(1, int(self.connection.query_timeout * 1000))), kind="collection")
                     for name in sorted(db.list_collection_names())]
 
     def get_schema(self, table):
         with self.session() as db:
-            documents = list(db[table].find().limit(100).max_time_ms(10000))
+            documents = list(db[table].find().limit(100).max_time_ms(max(1, int(self.connection.query_timeout * 1000))))
         names = list(dict.fromkeys(["_id"] + [key for document in documents for key in document]))
         return [ColumnInfo(name, "JSON" if any(isinstance(document.get(name), (dict, list)) for document in documents) else
                            "ObjectId" if name == "_id" else type(next((document[name] for document in documents if name in document), "")).__name__,
@@ -749,8 +940,8 @@ class MongoAdapter:
             query = {"$or": [{column.name: {"$regex": re.escape(search), "$options": "i"}}
                                for column in columns if column.name != "_id"]} if len(columns) > 1 else {"_id": search}
         with self.session() as db:
-            cursor = db[table].find(query).sort(sort_column or "_id", -1 if descending else 1).skip((page - 1) * page_size).limit(page_size).max_time_ms(10000)
-            return document_result(cursor, total=db[table].count_documents(query, maxTimeMS=10000))
+            cursor = db[table].find(query).sort(sort_column or "_id", -1 if descending else 1).skip((page - 1) * page_size).limit(page_size).max_time_ms(max(1, int(self.connection.query_timeout * 1000)))
+            return document_result(cursor, total=db[table].count_documents(query, maxTimeMS=max(1, int(self.connection.query_timeout * 1000))))
 
     def execute(self, query):
         try:
@@ -800,15 +991,15 @@ class MongoAdapter:
                 if command.get("sort"):
                     cursor = cursor.sort(list(command["sort"].items()))
                 cursor = cursor.skip(max(0, int(command.get("skip", 0)))).limit(min(MAX_ROWS + 1, max(1, int(command.get("limit", MAX_ROWS + 1)))))
-                documents = list(cursor.max_time_ms(10000))
+                documents = list(cursor.max_time_ms(max(1, int(self.connection.query_timeout * 1000))))
                 return document_result(documents[:MAX_ROWS], truncated=len(documents) > MAX_ROWS)
             if action == "aggregate":
                 pipeline = list(command.get("pipeline", []))
                 if not any("$out" in stage or "$merge" in stage for stage in pipeline):
                     pipeline.append({"$limit": MAX_ROWS + 1})
-                documents = list(db[command["aggregate"]].aggregate(pipeline, maxTimeMS=10000))
+                documents = list(db[command["aggregate"]].aggregate(pipeline, maxTimeMS=max(1, int(self.connection.query_timeout * 1000))))
                 return document_result(documents[:MAX_ROWS], truncated=len(documents) > MAX_ROWS)
-            response = db.command(command, maxTimeMS=10000)
+            response = db.command(command, maxTimeMS=max(1, int(self.connection.query_timeout * 1000)))
             # Write commands can return ok:1 together with writeErrors. Treat
             # these as failed operations, just as PyMongo's CRUD methods do.
             error = next(iter(response.get('writeErrors', [])), None) or response.get('writeConcernError')
@@ -874,7 +1065,7 @@ class RedisAdapter:
         options = dict(host=c.host, port=c.port or 6379, db=index,
                        username=c.username or None, password=c.password or None,
                        # Redis < 6 has no HELLO; RESP2 also supports modern ACL authentication.
-                       protocol=2, decode_responses=False, socket_connect_timeout=8, socket_timeout=10)
+                       protocol=2, decode_responses=False, socket_connect_timeout=8, socket_timeout=float(c.query_timeout))
         pool = None
         if self.endpoint:
             from .routing import redis_connection_class
@@ -1445,9 +1636,22 @@ class SSHAdapter:
 
     def _run(self, method, *args, **kwargs):
         from .ssh import ssh_endpoint
+        token = kwargs.get("cancel_token")
+        if token is not None:
+            token.raise_if_cancelled()
         with ssh_endpoint(self.connection) as endpoint:
             adapter = _direct_adapter(self.connection, endpoint=endpoint)
-            return getattr(adapter, method)(*args, **kwargs)
+            token = kwargs.get("cancel_token")
+            callback = getattr(adapter, "cancel", None)
+            if token is not None and callback is not None:
+                token.bind(callback)
+            try:
+                if token is not None:
+                    token.raise_if_cancelled()
+                return getattr(adapter, method)(*args, **kwargs)
+            finally:
+                if token is not None and callback is not None:
+                    token.unbind(callback)
 
     def test(self):
         return self._run("test")
@@ -1501,15 +1705,23 @@ class SSHAdapter:
         return self._run("drop_index", table, name)
 
     def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
-                   where_clause="", order_by=""):
+                   where_clause="", order_by="", **kwargs):
         return self._run("fetch_rows", table, page, page_size, search, sort_column, descending,
-                         where_clause, order_by)
+                         where_clause, order_by, **kwargs)
 
     def apply_grid_changes(self, table, *, updates=(), inserts=(), deletes=()):
         return self._run("apply_grid_changes", table, updates=updates, inserts=inserts, deletes=deletes)
 
-    def execute(self, query):
-        return self._run("execute", query)
+    def execute(self, query, cancel_token=None):
+        if cancel_token is None:
+            return self._run("execute", query)
+        return self._run("execute", query, cancel_token=cancel_token)
+
+    def export_csv(self, destination, **kwargs):
+        return self._run("export_csv", destination, **kwargs)
+
+    def explain(self, query, cancel_token=None):
+        return self._run("explain", query, cancel_token=cancel_token)
 
     def insert_row(self, table, values):
         return self._run("insert_row", table, values)

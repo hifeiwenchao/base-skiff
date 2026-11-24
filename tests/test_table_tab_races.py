@@ -151,7 +151,8 @@ def test_background_query_completion_restores_results_and_enabled_run(window, de
     window.query_editor.setPlainText('SELECT 42 AS answer')
     window.run_query()
     query = deferred.pending('execute')[0]
-    assert not window.run_button.isEnabled()
+    assert window.run_button.isEnabled()
+    assert window.run_button.text() == 'Cancel query'
     window.open_table('orders')
     deferred.finish(table='orders')
     window.query_editor.setPlainText('SELECT 7 AS other_answer')

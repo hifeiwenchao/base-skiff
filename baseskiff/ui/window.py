@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+import uuid
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -68,7 +70,7 @@ from baseskiff.redis_codec import json_safe, safe_text
 from baseskiff.service import DatabaseService
 from baseskiff.ui.connection_type import ConnectionTypeDialog
 from baseskiff.ui.dialogs import ConnectionDialog, RedisKeyDialog, RowDialog
-from baseskiff.ui.editor import QueryHighlighter
+from baseskiff.ui.editor import QueryEditor, QueryHighlighter
 from baseskiff.ui.icons import icon
 from baseskiff.ui.redis_tree import (
     NODE_ID_ROLE,
@@ -80,6 +82,8 @@ from baseskiff.ui.redis_tree import (
     iter_items,
 )
 from baseskiff.ui.redis_value import RedisValueWidget
+from baseskiff.ui.session_state import decode_workspace, encode_workspace
+from baseskiff.ui.sql_structure import SqlStructureDialog
 from baseskiff.ui.theme import STYLE
 from baseskiff.ui.workers import Worker
 from baseskiff.ui.workspace_tabs import WorkspaceTab
@@ -117,12 +121,7 @@ def button(text='', symbol='', callback=None, name='', tooltip=''):
 
 
 class QueryRunButton(QPushButton):
-    """Keep the running action clickable while preserving legacy enabled-state probes."""
-
-    def isEnabled(self):
-        if self.property('_query_running'):
-            return False
-        return super().isEnabled()
+    """A normal enabled button switches between run and cancel actions."""
 
 
 def layout(widget, margin=0, spacing=0, horizontal=False):
@@ -178,20 +177,6 @@ class RedisSearchModeCombo(QComboBox):
             painter, x, (self.height() - 14) // 2, 14, 14)
 
 
-class QueryEditor(QPlainTextEdit):
-    """SQL editor with a selection-only Shift+Enter execution gesture."""
-
-    execute_requested = Signal()
-
-    def keyPressEvent(self, event):
-        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
-            event.accept()
-            self.execute_requested.emit()
-            return
-        super().keyPressEvent(event)
-
-
 class TableTabBar(QTabBar):
     """Right-click menus target tabs without activating their workspace."""
 
@@ -243,10 +228,11 @@ class StatusDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
+    export_progress = Signal(object, int)
     def __init__(self, service=None, language=None):
         super().__init__()
         self.service = service or DatabaseService()
-        self.settings = QSettings('BaseSkiff', 'BaseSkiff')
+        self.settings = QSettings('BaseSkiff', 'BaseSkiff-Smoke' if getattr(service, 'ephemeral', False) else 'BaseSkiff')
         self.language = language or str(self.settings.value('language', 'zh'))
         self.translator = Translator(self.language)
         self.current_connection: Connection | None = None
@@ -270,6 +256,8 @@ class MainWindow(QMainWindow):
         self._rows_request = 0
         self._query_running = False
         self._query_cancel_token = None
+        self._export_jobs = {}
+        self._sql_metadata = {}
         self._query_state = ''
         self._query_error = ''
         self._closed = False
@@ -323,6 +311,7 @@ class MainWindow(QMainWindow):
         self._console_save_timer.setSingleShot(True)
         self._console_save_timer.setInterval(350)
         self._console_save_timer.timeout.connect(self._save_console_now)
+        self.export_progress.connect(self._update_export_progress)
         self._shortcuts()
         self.retranslate()
         self.connections = self.service.list_connections()
@@ -638,7 +627,7 @@ class MainWindow(QMainWindow):
         self.edit_row_button = button('', 'edit', self.edit_selected_row, 'iconButton')
         self.edit_row_button.setEnabled(False)
         toolbar_layout.addWidget(self.edit_row_button)
-        self.export_button = button('', 'download', self.export_data)
+        self.export_button = button('', 'download', self.show_export_menu)
         self.export_button.setMinimumWidth(88)
         toolbar_layout.addWidget(self.export_button)
         self.delete_key_button = button('', 'trash', self.delete_redis_key, 'iconButton')
@@ -699,6 +688,9 @@ class MainWindow(QMainWindow):
         pager_layout.addWidget(self.page_label)
         self.previous_button = button('', 'chevron-left', lambda: self.change_page(-1), 'iconButton')
         self.next_button = button('', 'chevron-right', lambda: self.change_page(1), 'iconButton')
+        self.count_total_button = button('', 'refresh', self.toggle_count_total, 'textButton')
+        self.count_total_button.setCheckable(True)
+        pager_layout.addWidget(self.count_total_button)
         pager_layout.addWidget(self.previous_button)
         pager_layout.addWidget(self.next_button)
         self.inspector_button = button('', 'panel', self.toggle_inspector, 'iconButton')
@@ -716,6 +708,8 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.query_hint, 1)
         self.query_template_button = button('', 'code', self.insert_query_template, 'textButton')
         tools.addWidget(self.query_template_button)
+        self.sql_tools_button = button('SQL', 'settings', self.show_sql_tools, 'textButton')
+        tools.addWidget(self.sql_tools_button)
         self.run_button = QueryRunButton()
         self.run_button.setObjectName('primaryButton')
         self.run_button.setIcon(icon('play', '#ffffff', 16))
@@ -736,7 +730,7 @@ class MainWindow(QMainWindow):
         result_heading = QHBoxLayout()
         self.query_status = label('', 'muted')
         result_heading.addWidget(self.query_status, 1)
-        self.query_export_button = button('', 'download', lambda: self.export_data(True), 'textButton')
+        self.query_export_button = button('', 'download', lambda: self.show_export_menu(True), 'textButton')
         result_heading.addWidget(self.query_export_button)
         results_layout.addLayout(result_heading)
         self.query_result_table = self._make_table()
@@ -954,6 +948,8 @@ class MainWindow(QMainWindow):
         QThreadPool.globalInstance().start(worker)
 
     def _open_initial(self):
+        if self._restore_session():
+            return
         if self.connections:
             self.activate_connection(next((c for c in self.connections if c.is_demo), self.connections[0]))
         else:
@@ -1930,7 +1926,10 @@ class MainWindow(QMainWindow):
         content = self.query_editor.toPlainText() if self._console_scope == scope else state.query_text
         state.query_text = content
         try:
-            self.service.save_console(scope[0], scope[1], content)
+            if len(scope) == 3:
+                self.service.save_console_document(scope[0], scope[1], scope[2], state.console_name or scope[2], content)
+            else:
+                self.service.save_console(scope[0], scope[1], content)
         except Exception as error:
             if not self._closed:
                 self.show_error(str(error))
@@ -1942,20 +1941,28 @@ class MainWindow(QMainWindow):
         self._console_scope = None
         self._active_workspace = None
 
-    def show_console(self, connection, database=None, content=None):
+    def show_console(self, connection, database=None, content=None, *, document_id='', document_name=''):
         """Open the persistent SQL Console for one connection/database pair."""
         if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
             return
         scope = self._console_scope_for(connection, database)
         if scope is None:
             return
+        if document_id:
+            scope = (*scope, str(document_id))
         if self._console_scope != scope:
             self._save_console_now()
             self._capture_workspace()
             state = self._console_workspaces.get(scope)
             if state is None:
                 state = WorkspaceTab(connection)
-                state.query_text = self.service.load_console(scope[0], scope[1])
+                if document_id:
+                    saved = next((record for record in self.service.list_console_documents(scope[0], scope[1])
+                                  if record['document_id'] == document_id), None)
+                    state.query_text = saved['content'] if saved else ''
+                    state.console_name = document_name or (saved['name'] if saved else document_id)
+                else:
+                    state.query_text = self.service.load_console(scope[0], scope[1])
                 self._console_workspaces[scope] = state
             else:
                 state.connection = connection
@@ -1967,6 +1974,7 @@ class MainWindow(QMainWindow):
             self.current_result = QueryResult()
             self.query_result = state.query_result
             self._query_running = state.query_running
+            self._query_cancel_token = state.query_cancel_token
             self._query_state = state.query_state
             self._query_error = state.query_error
             self._redis_snapshot = None
@@ -1988,6 +1996,9 @@ class MainWindow(QMainWindow):
             state.query_text = content
         self._navigation = 'workspace'
         self.stack.setCurrentIndex(0)
+        self._sync_sql_metadata()
+        if connection.id not in self._connection_tables:
+            self.refresh_sql_metadata()
         self.update_context()
         self.update_query_status()
         self.update_nav()
@@ -2017,7 +2028,7 @@ class MainWindow(QMainWindow):
             return 0
         return len(state.pending_updates) + len(state.pending_inserts) + len(state.pending_deletes)
 
-    def _confirm_pending_grid(self, state):
+    def _confirm_pending_grid(self, state, *, discard=True):
         if not self._pending_grid_count_for(state):
             return True
         answer = QMessageBox.warning(
@@ -2029,9 +2040,11 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Discard:
             return False
-        state.pending_updates.clear()
-        state.pending_inserts.clear()
-        state.pending_deletes.clear()
+        if discard:
+            state.pending_updates.clear()
+            state.pending_inserts.clear()
+            state.pending_deletes.clear()
+            state.dirty = True
         return True
 
     def _tab_index(self, identity):
@@ -2073,7 +2086,7 @@ class MainWindow(QMainWindow):
     def close_all_table_tabs(self):
         if not self.table_tabs.count():
             return
-        if any(not self._confirm_pending_grid(state) for state in self._workspace_tabs.values()):
+        if any(not self._confirm_pending_grid(state, discard=False) for state in self._workspace_tabs.values()):
             return
         self._capture_workspace()
         for state in self._workspace_tabs.values():
@@ -2123,6 +2136,7 @@ class MainWindow(QMainWindow):
             setattr(self, name, getattr(state, name))
         self.where_clause, self.order_by = state.where_clause, state.order_by
         self._query_running, self._query_state, self._query_error = state.query_running, state.query_state, state.query_error
+        self._query_cancel_token = state.query_cancel_token
         self._redis_snapshot = state.redis_snapshot
         for widget, value, setter in ((self.data_search, state.search, 'setText'),
                                       (self.where_edit, state.where_draft, 'setText'),
@@ -2225,6 +2239,7 @@ class MainWindow(QMainWindow):
         self.sort_column, self.descending = '', False
         self.where_clause, self.order_by = '', ''
         self._query_running, self._query_state, self._query_error = False, '', ''
+        self._query_cancel_token = None
         self._redis_snapshot = None
         self.redis_view.clear()
         self.data_search.blockSignals(True)
@@ -2254,6 +2269,10 @@ class MainWindow(QMainWindow):
             if not state.accepts('schema', request):
                 return
             state.columns = columns
+            if state.connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+                scope = self._console_scope_for(state.connection)
+                self._sql_metadata.setdefault(scope, {})[str(state.table)] = [c.name for c in columns]
+                self._sync_sql_metadata()
             if self._workspace_is_active(state):
                 self.columns = columns
                 self.render_schema()
@@ -2287,7 +2306,17 @@ class MainWindow(QMainWindow):
         self._capture_workspace()
         state = WorkspaceTab(self.current_connection, table)
         state.page_size = self.page_size
+        state.count_total = self.current_connection.is_demo
         self._workspace_tabs[identity] = state
+        self._register_table_tab(state)
+        self._activate_workspace(state, capture=False)
+        self.insert_query_template()
+        state.query_text = self.query_editor.toPlainText()
+        self._load_table_schema(state)
+        self.refresh_data()
+
+    def _register_table_tab(self, state):
+        identity = state.identity
         self.table_tabs.blockSignals(True)
         index = self.table_tabs.addTab('')
         self.table_tabs.setTabData(index, identity)
@@ -2301,11 +2330,46 @@ class MainWindow(QMainWindow):
         self.table_tabs.setTabButton(index, QTabBar.ButtonPosition.RightSide, close_button)
         self.table_tabs.blockSignals(False)
         self._update_table_tab_labels()
-        self._activate_workspace(state, capture=False)
-        self.insert_query_template()
-        state.query_text = self.query_editor.toPlainText()
-        self._load_table_schema(state)
-        self.refresh_data()
+
+    def _save_session(self):
+        self._capture_workspace()
+        states = [self._workspace_tabs.get(self.table_tabs.tabData(i)) for i in range(self.table_tabs.count())]
+        descriptors = [encode_workspace(state) for state in states if state is not None and not state.closed]
+        active = self._tab_index(self._active_workspace.identity) if self._active_workspace else -1
+        payload = {'version': 1, 'tabs': descriptors, 'active': active,
+                   'console': list(self._console_scope) if self._console_scope else None}
+        self.settings.setValue('workspaceSession', json.dumps(payload, ensure_ascii=False))
+
+    def _restore_session(self):
+        try:
+            payload = json.loads(str(self.settings.value('workspaceSession', '{}')))
+            if not isinstance(payload, dict) or payload.get('version') != 1:
+                return False
+            records = payload.get('tabs', [])
+            if not isinstance(records, list):
+                return False
+            active = payload.get('active', 0)
+            active_state = None
+            for index, record in enumerate(records[:100]):
+                state = decode_workspace(record, self.connections)
+                if state is None or state.identity in self._workspace_tabs:
+                    continue
+                self._workspace_tabs[state.identity] = state
+                self._register_table_tab(state)
+                if index == active:
+                    active_state = state
+            console = payload.get('console')
+            if isinstance(console, list) and len(console) in (2, 3):
+                connection = next((c for c in self.connections if c.id == console[0]), None)
+                if connection and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+                    self.show_console(connection, console[1], document_id=console[2] if len(console) == 3 else '')
+                    return True
+            if self._workspace_tabs:
+                self._activate_workspace(active_state or next(iter(self._workspace_tabs.values())), capture=False)
+                return True
+        except (ValueError, TypeError, KeyError):
+            pass
+        return False
 
     def refresh_data(self, *, force=False):
         if not self.current_connection or not self.current_table:
@@ -2327,6 +2391,10 @@ class MainWindow(QMainWindow):
         page, page_size = state.page, state.page_size
         search, sort_column, descending = state.search, state.sort_column, state.descending
         where_clause, order_by = state.where_clause, state.order_by
+        signature = (search, sort_column, descending, where_clause, order_by, page_size)
+        if state.pagination_signature != signature or page == 1:
+            state.page_cursors.clear()
+            state.pagination_signature = signature
         request = state.request('rows')
         self._rows_request += 1
         def loaded(result):
@@ -2341,8 +2409,10 @@ class MainWindow(QMainWindow):
                     row.update(values)
                 result.total = max(0, result.total - len(deleted) + len(state.pending_inserts))
             state.current_result, state.total_rows, state.error = result, result.total, ''
+            if result.next_cursor is not None:
+                state.page_cursors[page + 1] = result.next_cursor
             last_page = max(1, math.ceil(result.total / page_size))
-            if state.page > last_page:
+            if result.total_known and state.page > last_page:
                 state.page = last_page
                 if self._workspace_is_active(state):
                     self.page = last_page
@@ -2355,9 +2425,11 @@ class MainWindow(QMainWindow):
                 self.update_context()
                 self.footer_detail.setText(f'{result.elapsed_ms:.1f} ms  ·  {connection.kind}  ·  BaseSkiff 0.1.0')
                 self.selection_changed()
-        self.submit(partial(self.service.fetch_rows, connection.id, table, page=page, page_size=page_size,
-                            search=search, sort_column=sort_column, descending=descending,
-                            where_clause=where_clause, order_by=order_by), loaded,
+        kwargs = dict(page=page, page_size=page_size, search=search, sort_column=sort_column,
+                      descending=descending, where_clause=where_clause, order_by=order_by)
+        if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            kwargs.update(count_total=('exact' if state.count_total and not connection.is_demo else state.count_total), after_key=state.page_cursors.get(page))
+        self.submit(partial(self.service.fetch_rows, connection.id, table, **kwargs), loaded,
                     lambda message: self._workspace_error(state, 'rows', request, message))
 
     def _refresh_redis_value(self, state=None):
@@ -2570,7 +2642,11 @@ class MainWindow(QMainWindow):
         self.refresh_data()
 
     def change_page(self, delta):
-        self.page = min(max(1, self.page + delta), max(1, math.ceil(self.total_rows / self.page_size)))
+        result = self.current_result
+        if delta > 0 and not result.total_known and not result.has_more:
+            return
+        maximum = max(1, math.ceil(self.total_rows / self.page_size)) if result.total_known else self.page + 1
+        self.page = min(max(1, self.page + delta), maximum)
         self.refresh_data()
 
     def change_page_size(self, text):
@@ -2578,19 +2654,41 @@ class MainWindow(QMainWindow):
         self.page = 1
         self.refresh_data()
 
+    def toggle_count_total(self):
+        state = self._workspace_state()
+        if state is None:
+            return
+        state.count_total = self.count_total_button.isChecked()
+        self.refresh_data()
+
     def update_pager(self):
-        first = (self.page - 1) * self.page_size + 1 if self.total_rows else 0
-        last = min(self.page * self.page_size, self.total_rows)
-        self.record_count.setText(self.t(f'显示 {first}–{last} 条，共 {self.total_rows:,} 条记录', f'Showing {first}–{last} of {self.total_rows:,} records'))
-        pages = max(1, math.ceil(self.total_rows / self.page_size))
-        self.page_label.setText(self.t(f'第 {self.page} / {pages} 页', f'Page {self.page} of {pages}'))
+        result = self.current_result
+        first = (self.page - 1) * self.page_size + 1 if result.rows else 0
+        last = (self.page - 1) * self.page_size + len(result.rows) if result.rows else 0
+        if result.total_known:
+            self.record_count.setText(self.t(f'显示 {first}–{last} 条，共 {self.total_rows:,} 条记录', f'Showing {first}–{last} of {self.total_rows:,} records'))
+            pages = max(1, math.ceil(self.total_rows / self.page_size))
+            self.page_label.setText(self.t(f'第 {self.page} / {pages} 页', f'Page {self.page} of {pages}'))
+            more = self.page < pages
+        else:
+            self.record_count.setText(self.t(f'显示 {first}–{last} 条 · 总数未统计', f'Showing {first}–{last} · total unknown'))
+            self.page_label.setText(self.t(f'第 {self.page} 页', f'Page {self.page}'))
+            more = result.has_more
         self.previous_button.setEnabled(self.page > 1)
-        self.next_button.setEnabled(self.page < pages)
+        self.next_button.setEnabled(more)
+        self.count_total_button.setText(self.t('统计总数', 'Count rows'))
+        state = self._active_workspace
+        with QSignalBlocker(self.count_total_button):
+            self.count_total_button.setChecked(bool(state and state.count_total))
+        self.count_total_button.setVisible(bool(self.current_connection and self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}))
 
     def update_context(self):
         connection = self.current_connection
         self._sync_redis_search()
         console_active = self._console_scope is not None
+        sql = bool(connection and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'})
+        self.query_editor.set_sql_enabled(sql)
+        self.sql_tools_button.setVisible(sql)
         self.table_tabs.setVisible(not console_active)
         self.tabs.setVisible(not console_active)
         self.console_page.setVisible(console_active)
@@ -2643,6 +2741,7 @@ class MainWindow(QMainWindow):
         self.run_button.setToolTip(self.t('中断正在执行的查询', 'Interrupt the running query') if self._query_running else
                                    self.t('执行当前选中语句或全文', 'Run the selected statement or the full editor'))
         self.export_button.setEnabled(bool(self.current_result.columns))
+        self.sql_tools_button.setText((self._console_state().console_name or 'SQL') if self._console_state() else 'SQL')
         self.query_hint.setText(self.t('⌘ / Ctrl + Enter 执行 · Shift + Enter 执行选中 · 最多返回 1,000 行',
                                       '⌘ / Ctrl + Enter to run · Shift + Enter selection · Up to 1,000 rows'))
         if connection and connection.kind == 'MongoDB':
@@ -2841,7 +2940,7 @@ class MainWindow(QMainWindow):
             query = f'SELECT *\nFROM {quoted}\n' + ('FETCH FIRST 100 ROWS ONLY;' if connection.kind == 'Oracle' else 'LIMIT 100;')
         self.query_editor.setPlainText(query)
 
-    def run_query(self):
+    def run_query(self, _checked=False, *, current_only=False, explain=False):
         if self._query_running:
             self.cancel_query()
             return
@@ -2857,7 +2956,7 @@ class MainWindow(QMainWindow):
             self.show_workspace()
             self.tabs.setCurrentIndex(1)
         cursor = self.query_editor.textCursor()
-        query = cursor.selectedText().replace('\u2029', '\n') if cursor.hasSelection() else self.query_editor.toPlainText()
+        query = self.query_editor.current_statement() if current_only or explain else (cursor.selectedText().replace('\u2029', '\n') if cursor.hasSelection() else self.query_editor.toPlainText())
         state = self._console_state() if console_active else self._workspace_state()
         if state is None:
             return
@@ -2865,6 +2964,7 @@ class MainWindow(QMainWindow):
         request = state.request('query')
         cancel_token = CancellationToken()
         self._query_cancel_token = cancel_token
+        state.query_cancel_token = cancel_token
         self._query_running, self._query_state = True, 'running'
         state.query_running, state.query_state, state.query_error = True, 'running', ''
         self.update_context()
@@ -2877,9 +2977,10 @@ class MainWindow(QMainWindow):
                     self.refresh_catalog(connection, owner=state)
                 return
             state.query_running, state.query_state, state.query_result = False, 'success', result
+            state.query_cancel_token = None
             if self._query_cancel_token is cancel_token:
                 self._query_cancel_token = None
-            active_console = self._console_scope == self._console_scope_for(connection)
+            active_console = self._console_state() is state
             if (active_console or self._workspace_is_active(state)):
                 self._query_running, self._query_state, self.query_result = False, 'success', result
                 self.populate_table(self.query_result_table, result)
@@ -2891,10 +2992,11 @@ class MainWindow(QMainWindow):
             if not state.accepts('query', request):
                 return
             state.query_running, state.query_state, state.query_error = False, 'failed', message
+            state.query_cancel_token = None
             state.query_result = QueryResult()
             if self._query_cancel_token is cancel_token:
                 self._query_cancel_token = None
-            active_console = self._console_scope == self._console_scope_for(connection)
+            active_console = self._console_state() is state
             if active_console or self._workspace_is_active(state):
                 self._query_running, self._query_state, self._query_error = False, 'failed', message
                 self.query_result = state.query_result
@@ -2908,17 +3010,21 @@ class MainWindow(QMainWindow):
             supports_cancel = False
         execute_kwargs = ({'cancel_token': cancel_token}
                           if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and supports_cancel else {})
-        self.submit(self._connection_operation('execute', connection, query, **execute_kwargs), done, failed)
+        self.submit(self._connection_operation('explain' if explain else 'execute', connection, query, **execute_kwargs), done, failed)
 
     def cancel_query(self):
-        token = self._query_cancel_token
+        state = self._console_state() if self._console_scope is not None else self._workspace_state()
+        token = state.query_cancel_token if state is not None else None
         if token is None and not self._query_running:
             return
-        state = self._console_state() if self._console_scope is not None else self._workspace_state()
         if token is not None:
-            token.cancel()
+            accepted = token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None))
+            if not accepted:
+                self.query_status.setText(self.t('正在提交，等待数据库确认结果…', 'Committing; waiting for the database result…'))
+                return
         self._query_cancel_token = None
         if state is not None:
+            state.query_cancel_token = None
             # Invalidate the request immediately. The worker may still unwind
             # through a driver, but its eventual signal cannot update a newer
             # Console/table state.
@@ -3249,6 +3355,8 @@ class MainWindow(QMainWindow):
     def _add_sql_table_operations(self, menu, connection, table):
         """Keep all table DDL actions under the same context-menu submenu."""
         ddl = menu.addMenu(icon('settings'), self.t('表结构操作', 'Table operations'))
+        ddl.addAction(self.t('修改表结构…', 'Modify table structure…'), lambda: self.modify_sql_structure(connection, table))
+        ddl.addSeparator()
         ddl.addAction(self.t('重命名表', 'Rename table'), lambda: self.rename_sql_table(connection, table))
         ddl.addAction(self.t('清空表数据', 'Truncate table'), lambda: self.truncate_sql_table(connection, table))
         ddl.addAction(self.t('添加字段', 'Add column'), lambda: self.add_sql_column(connection, table))
@@ -3506,6 +3614,195 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(text)
 
+    def _sync_sql_metadata(self):
+        connection = self.current_connection
+        if not connection:
+            return
+        tables = self._connection_tables.get(connection.id, [])
+        self.query_editor.set_metadata([t.qualified_name for t in tables],
+            self._sql_metadata.get(self._console_scope_for(connection), {}))
+
+    def refresh_sql_metadata(self):
+        connection = self.current_connection
+        if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            return
+        scope = self._console_scope_for(connection)
+        def load():
+            tables = self._connection_operation('list_tables', connection)()
+            # Warm only a bounded set; typing never queries the server.
+            columns = {}
+            for table in tables[:30]:
+                columns[table.qualified_name] = [c.name for c in self._connection_operation('get_schema', connection, table.qualified_name)()]
+            return tables, columns
+        def loaded(result):
+            tables, columns = result
+            if not any(c.id == connection.id for c in self.connections):
+                return
+            self._connection_tables[connection.id] = tables
+            self._sql_metadata[scope] = columns
+            if self.current_connection and self._console_scope_for(self.current_connection) == scope:
+                self._sync_sql_metadata()
+                self.footer_detail.setText(self.t(f'提示缓存已更新 · {len(columns)} 张表', f'Completion cache updated · {len(columns)} tables'))
+                self.rebuild_tree()
+        self.submit(load, loaded, self.show_error)
+
+    def show_sql_tools(self):
+        menu = QMenu(self)
+        menu.addAction(self.t('执行当前语句', 'Run current statement'), lambda: self.run_query(current_only=True))
+        menu.addAction(self.t('格式化 SQL', 'Format SQL'), self.query_editor.format_sql)
+        menu.addAction(self.t('执行计划', 'Execution plan'), lambda: self.run_query(explain=True))
+        menu.addAction(self.t('刷新表和字段提示', 'Refresh completion metadata'), self.refresh_sql_metadata)
+        menu.addSeparator()
+        consoles = menu.addMenu(self.t('Console 工作区', 'Console workspaces'))
+        connection = self.current_connection
+        scope = self._console_scope_for(connection)
+        consoles.addAction(self.t('默认 Console', 'Default Console'), lambda: self.show_console(connection))
+        for record in self.service.list_console_documents(scope[0], scope[1]):
+            consoles.addAction(record['name'], lambda _checked=False, record=record: self.show_console(connection, document_id=record['document_id']))
+        consoles.addSeparator()
+        consoles.addAction(self.t('新建 Console…', 'New Console…'), self.new_console_document)
+        if self._console_scope and len(self._console_scope) == 3:
+            consoles.addAction(self.t('重命名 Console…', 'Rename Console…'), self.rename_console_document)
+            consoles.addAction(self.t('删除此 Console…', 'Delete this Console…'), self.delete_console_document)
+        menu.addAction(self.t('打开 SQL 文件…', 'Open SQL file…'), self.open_sql_file)
+        menu.addAction(self.t('保存 SQL 文件…', 'Save SQL file…'), self.save_sql_file)
+        menu.exec(self.sql_tools_button.mapToGlobal(self.sql_tools_button.rect().bottomLeft()))
+
+    def new_console_document(self):
+        name, accepted = QInputDialog.getText(self, self.t('新建 Console', 'New Console'), self.t('名称', 'Name'))
+        if accepted and name.strip():
+            self.show_console(self.current_connection, document_id=uuid.uuid4().hex, document_name=name.strip())
+            self._save_console_now()
+
+    def rename_console_document(self):
+        state = self._console_state()
+        if not state or len(self._console_scope) != 3:
+            return
+        name, accepted = QInputDialog.getText(self, self.t('重命名 Console', 'Rename Console'), self.t('名称', 'Name'), text=state.console_name)
+        if accepted and name.strip():
+            state.console_name = name.strip()
+            self._save_console_now()
+            self.update_context()
+
+    def delete_console_document(self):
+        scope = self._console_scope
+        if not scope or len(scope) != 3:
+            return
+        state = self._console_state()
+        if state.query_running:
+            self.show_error(self.t('请先中断此 Console 的查询。', 'Cancel this Console query first.'))
+            return
+        if QMessageBox.question(self, self.t('删除 Console', 'Delete Console'),
+            self.t('删除此 Console 及其保存的 SQL？', 'Delete this Console and its saved SQL?'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        connection = state.connection
+        self.show_console(connection)
+        self.service.delete_console_document(*scope)
+        self._console_workspaces.pop(scope, None)
+
+    def open_sql_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, self.t('打开 SQL 文件', 'Open SQL file'), '', 'SQL (*.sql);;All files (*)')
+        if path:
+            try:
+                if Path(path).stat().st_size > 2 * 1024 * 1024:
+                    raise ValueError(self.t('编辑器最多打开 2 MiB SQL 文件。', 'The editor supports SQL files up to 2 MiB.'))
+                self.query_editor.setPlainText(Path(path).read_text(encoding='utf-8-sig'))
+            except (OSError, UnicodeError, ValueError) as error:
+                self.show_error(str(error))
+
+    def save_sql_file(self):
+        path, _ = QFileDialog.getSaveFileName(self, self.t('保存 SQL 文件', 'Save SQL file'), 'query.sql', 'SQL (*.sql)')
+        if path:
+            try:
+                Path(path).write_text(self.query_editor.toPlainText(), encoding='utf-8')
+            except OSError as error:
+                self.show_error(str(error))
+
+    def modify_sql_structure(self, connection, table):
+        def load():
+            return (self._connection_operation('get_schema', connection, table)(),
+                    self._connection_operation('list_indexes', connection, table)())
+        def loaded(metadata):
+            dialog = SqlStructureDialog(connection.kind, table, *metadata, parent=self,
+                                        language=self.language, read_only=connection.read_only)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            def apply(statements):
+                def operation():
+                    completed = 0
+                    for statement in statements:
+                        try:
+                            self._connection_operation('execute', connection, statement)()
+                        except Exception as error:
+                            raise RuntimeError(self.t(f'已完成 {completed}/{len(statements)} 条；其余未执行。请关闭后重新打开检查实际结构。\n',
+                                f'Completed {completed}/{len(statements)} statements; remaining steps were not executed. Reopen to inspect the actual structure.\n') + str(error)) from error
+                        completed += 1
+                    return load()
+                def done(result):
+                    dialog.mark_applied(*result)
+                    self.refresh_catalog(connection)
+                def failed(message):
+                    dialog.show_apply_error(message)
+                    self.refresh_catalog(connection)
+                self.submit(operation, done, failed)
+            dialog.apply_requested.connect(apply)
+            dialog.show()
+        self.submit(load, loaded, self.show_error)
+
+    def show_export_menu(self, query=False):
+        if not self.current_connection or self.current_connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            self.export_data(query)
+            return
+        menu = QMenu(self)
+        menu.addAction(self.t('当前显示数据 CSV…', 'Displayed data CSV…'), lambda: self.export_data(query))
+        menu.addAction(self.t('数据库全部结果 CSV…', 'All database results CSV…'), lambda: self.export_all_data(query))
+        source = self.query_export_button if query else self.export_button
+        menu.exec(source.mapToGlobal(source.rect().bottomLeft()))
+
+    def _update_export_progress(self, dialog, count):
+        if dialog in self._export_jobs:
+            dialog.setLabelText(self.t(f'已导出 {count:,} 行…', f'Exported {count:,} rows…'))
+
+    def export_all_data(self, query=False):
+        connection = self.current_connection
+        if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
+            return
+        options = {}
+        if query:
+            options['query'] = self.query_editor.current_statement()
+        else:
+            state = self._workspace_state()
+            if not state or not state.table:
+                return
+            options = dict(table=state.table, search=state.search, sort_column=state.sort_column,
+                           descending=state.descending, where_clause=state.where_clause, order_by=state.order_by)
+        path, _ = QFileDialog.getSaveFileName(self, self.t('导出全部数据库结果', 'Export all database results'), 'export.csv', 'CSV (*.csv)')
+        if not path:
+            return
+        token = CancellationToken()
+        dialog = QProgressDialog(self.t('准备导出…', 'Preparing export…'), self.t('取消', 'Cancel'), 0, 0, self)
+        dialog.setWindowTitle(self.t('后台导出 CSV', 'Exporting CSV'))
+        dialog.setMinimumDuration(0)
+        self._export_jobs[dialog] = token
+        dialog.canceled.connect(lambda: token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None)))
+        def finish():
+            self._export_jobs.pop(dialog, None)
+            dialog.close()
+            dialog.deleteLater()
+        def done(result):
+            finish()
+            self.footer_detail.setText(self.t(f'已导出 {result.affected:,} 行 · {path}', f'Exported {result.affected:,} rows · {path}'))
+        def failed(message):
+            finish()
+            if token.cancelled:
+                self.footer_detail.setText(self.t('导出已取消', 'Export cancelled'))
+            else:
+                self.show_error(message)
+        self.submit(self._connection_operation('export_csv', connection, path, **options,
+                    cancel_token=token, progress=lambda count: self.export_progress.emit(dialog, count)), done, failed)
+        dialog.show()
+
     def export_data(self, query=False):
         # QPushButton.clicked passes a bool; the explicit query button uses True.
         result = self.query_result if query is True else self.current_result
@@ -3691,9 +3988,17 @@ class MainWindow(QMainWindow):
             'BaseSkiff 0.1.0\nA thoughtful workspace for your databases.\n\n• Use + to add a connection; right-click to edit or remove.\n• Select a record and click Edit in the toolbar; select several to delete.\n• Tables without a primary key can be changed in the query editor.\n• Export saves the current page or current query result as CSV.\n• ⌘ / Ctrl + Enter runs queries; + K finds; + N adds a connection.\n• Passwords are encrypted on this computer and remain available after restarting.\n\nSQL: standard SQL, one statement at a time\nMongoDB: JSON commands, e.g. {"find": "users", "filter": {}}\nRedis: commands, e.g. GET mykey\n\nThe local playground is yours to explore, with no external connection.'))
 
     def closeEvent(self, event):
-        if self._query_running:
-            self.cancel_query()
+        if any(not self._confirm_pending_grid(state, discard=False) for state in self._workspace_tabs.values()):
+            event.ignore()
+            return
+        self._save_session()
         self._save_console_now()
+        for state in list(self._workspace_tabs.values()) + list(self._console_workspaces.values()):
+            if state.query_cancel_token is not None:
+                state.query_cancel_token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None))
+            state.close()
+        for token in self._export_jobs.values():
+            token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None))
         self._closed = True
         self.settings.setValue('language', self.language)
         event.accept()
