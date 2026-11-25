@@ -180,3 +180,34 @@ def test_ci_failure_summary_bounds_a_single_long_line(tmp_path, monkeypatch):
     assert 'discarded-prefix' not in summary
     assert 'retained-tail' in summary
     assert len(summary.encode('utf-8')) < 17000
+
+
+def test_build_directory_timestamp_format_and_same_second_collision(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 11, 25, 12, 20, 15)
+
+    monkeypatch.setattr(build, 'datetime', FrozenDatetime)
+    first = build.create_build_directory(tmp_path)
+    marker = first / 'running-marker'
+    marker.write_text('preserve')
+    second = build.create_build_directory(tmp_path)
+    assert first.name == 'build-20261125122015'
+    assert second.name == 'build-20261125122016'
+    assert marker.read_text() == 'preserve'
+
+
+def test_timestamp_collision_rolls_over_date(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 12, 31, 23, 59, 59)
+
+    monkeypatch.setattr(build, 'datetime', FrozenDatetime)
+    build.create_build_directory(tmp_path)
+    assert build.create_build_directory(tmp_path).name == 'build-20270101000000'

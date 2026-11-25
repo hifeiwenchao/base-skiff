@@ -8,11 +8,24 @@ import importlib.util
 import os
 import subprocess
 import sys
-import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def create_build_directory(root: Path) -> Path:
+    """Reserve a timestamp path atomically without replacing earlier builds."""
+    root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().replace(microsecond=0)
+    while True:
+        candidate = root / timestamp.strftime("build-%Y%m%d%H%M%S")
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            timestamp += timedelta(seconds=1)
+        else:
+            return candidate
 
 
 def _failure_summary(path: str | None, title: str, details: str) -> None:
@@ -53,8 +66,7 @@ def main() -> int:
     # startup. Replacing or moving a running bundle can therefore corrupt later
     # driver imports. Keep every build at its own permanent, exclusive path.
     dist_root = args.dist_dir.resolve()
-    dist_root.mkdir(parents=True, exist_ok=True)
-    dist_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("build-%Y%m%d-%H%M%S-"), dir=dist_root))
+    dist_dir = create_build_directory(dist_root)
     work_dir = args.work_dir.resolve() / dist_dir.name
     command = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",

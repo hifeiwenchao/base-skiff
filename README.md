@@ -195,13 +195,13 @@ Redis 集合超过 1,000 项时，Hash / Set / ZSet 的逐项修改和 List 的�
 .venv/bin/python -m baseskiff --screenshot /absolute/path/baseskiff.png
 ```
 
-构建脚本调用当前 Python 环境中的 PyInstaller，不会自动安装依赖。`--dist-dir` 和 `--work-dir` 可指定输出与构建缓存的父目录。每次构建生成独立的 `build-日期-随机值` 子目录，并打印应用的完整路径；之前的应用目录会保留，避免覆盖运行中的程序导致驱动解压失败。退出旧版后再打开新目录中的应用；清理旧目录前应先退出对应应用。**必须分别在目标系统上构建**，并匹配目标 CPU 架构；macOS 的本机 arm64 构建不是 Intel / Apple Silicon 通用二进制。
+构建脚本调用当前 Python 环境中的 PyInstaller，不会自动安装依赖。`--dist-dir` 和 `--work-dir` 可指定输出与构建缓存的父目录。每次构建生成独立的 `build-YYYYMMDDHHMMSS` 子目录；同一秒重复构建会顺延到下一秒，并打印应用的完整路径；之前的应用目录会保留，避免覆盖运行中的程序导致驱动解压失败。退出旧版后再打开新目录中的应用；清理旧目录前应先退出对应应用。**必须分别在目标系统上构建**，并匹配目标 CPU 架构；macOS 的本机 arm64 构建不是 Intel / Apple Silicon 通用二进制。
 
 | 平台 | 构建输出 | 运行 |
 | --- | --- | --- |
-| macOS | `dist/build-<id>/BaseSkiff.app` | Finder 打开应用 |
-| Windows | `dist/build-<id>/BaseSkiff/` | `BaseSkiff.exe` |
-| Linux | `dist/build-<id>/BaseSkiff/` | `./BaseSkiff` |
+| macOS | `dist/build-YYYYMMDDHHMMSS/BaseSkiff.app` | Finder 打开应用 |
+| Windows | `dist/build-YYYYMMDDHHMMSS/BaseSkiff/` | `BaseSkiff.exe` |
+| Linux | `dist/build-YYYYMMDDHHMMSS/BaseSkiff/` | `./BaseSkiff` |
 
 Windows / Linux 需要保留整个输出文件夹，包含 `_internal` 中的依赖。数据库驱动和 Qt 原生库随应用打包；外部数据库服务仍由用户提供。QtWebEngine 不属于此应用。
 
@@ -221,7 +221,7 @@ BaseSkiff is a native Python / PySide6 desktop database workspace for macOS, Win
 
 Create a Python 3.11+ virtual environment, install `requirements.txt`, then run `python -m baseskiff`. Run `python -m pytest -q` for tests and `python scripts/build.py --smoke-test` to build on the target OS. Windows and Linux outputs require the complete application folder.
 
-Each build uses a separate `dist/build-<id>/` directory and prints the full app path. `--dist-dir` and `--work-dir` select parent directories. Existing bundles remain untouched: replacing a running frozen app can break later driver imports with a decompression error. Quit the old app before opening the new build or removing its old directory.
+Each build uses a separate `dist/build-YYYYMMDDHHMMSS/` directory; repeated builds in the same second advance to the next free second and prints the full app path. `--dist-dir` and `--work-dir` select parent directories. Existing bundles remain untouched: replacing a running frozen app can break later driver imports with a decompression error. Quit the old app before opening the new build or removing its old directory.
 
 **New connection** opens a database type picker, then the selected type's connection form. The database type is fixed in both new and existing connection forms. Editing opens the form directly. Use Tab and Enter to choose a type or Esc to cancel; cancelling does not save a connection.
 
