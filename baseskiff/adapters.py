@@ -678,6 +678,11 @@ class SQLAdapter:
             result.truncated = False
             result.total = count if count is not None else (page - 1) * page_size + len(result.rows)
             result.total_known = exact_count
+            # A complete first page already establishes the exact total without
+            # scanning COUNT(*). A cursor page covers only a suffix of the table.
+            if not count_total and page == 1 and after_key is None and not result.has_more:
+                result.total = len(result.rows)
+                result.total_known = True
             result.next_cursor = result.rows[-1][cursor_key] if keyset and result.rows else None
             return result
 

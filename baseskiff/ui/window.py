@@ -2671,7 +2671,7 @@ class MainWindow(QMainWindow):
             self.page_label.setText(self.t(f'第 {self.page} / {pages} 页', f'Page {self.page} of {pages}'))
             more = self.page < pages
         else:
-            self.record_count.setText(self.t(f'显示 {first}–{last} 条 · 总数未统计', f'Showing {first}–{last} · total unknown'))
+            self.record_count.setText(self.t(f'显示 {first}–{last} 条 · 总数未统计', f'Showing {first}–{last} · total not counted'))
             self.page_label.setText(self.t(f'第 {self.page} 页', f'Page {self.page}'))
             more = result.has_more
         self.previous_button.setEnabled(self.page > 1)

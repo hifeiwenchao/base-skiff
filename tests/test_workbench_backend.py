@@ -302,3 +302,26 @@ def test_service_forwards_explicit_exact_count(database, tmp_path, monkeypatch):
     monkeypatch.setattr('baseskiff.service.adapter_for', lambda _c: RecordingAdapter())
     service.fetch_rows(connection.id, 'records', count_total='exact')
     assert options[0]['count_total'] == 'exact'
+
+
+@pytest.mark.parametrize('size', [0, 7, 50])
+def test_first_page_complete_result_knows_total_without_count(database, monkeypatch, size):
+    adapter, _ = database
+    queries = []
+    original = adapter._query
+    def query(db, sql, *args, **kwargs):
+        queries.append(sql)
+        return original(db, sql, *args, **kwargs)
+    monkeypatch.setattr(adapter, '_query', query)
+    result = adapter.fetch_rows('records', page_size=50, where_clause=f'id <= {size}', count_total=False)
+    assert result.total_known
+    assert result.total == size
+    assert not result.has_more
+    assert not any('COUNT(' in sql.upper() for sql in queries)
+
+
+def test_cursor_result_does_not_claim_full_total(database):
+    adapter, _ = database
+    result = adapter.fetch_rows('records', page=1, page_size=50, count_total=False, after_key=1200)
+    assert not result.total_known
+    assert len(result.rows) == 5

@@ -114,7 +114,7 @@ def test_large_table_uses_count_free_paging_with_next_page(qtbot, tmp_path):
     qtbot.waitUntil(lambda: not window.busy)
     assert not window.current_result.total_known
     assert window.next_button.isEnabled()
-    assert 'unknown' in window.record_count.text()
+    assert 'total not counted' in window.record_count.text()
     first_id = window.current_result.rows[-1]['id']
     window.change_page(1)
     qtbot.waitUntil(lambda: not window.busy)
@@ -228,4 +228,21 @@ def test_cancel_close_keeps_all_tabs_pending_edits(qtbot, tmp_path, monkeypatch)
     assert window.isVisible()
     assert first.pending_updates and second.pending_inserts
     monkeypatch.setattr(QMessageBox, 'warning', lambda *args: QMessageBox.StandardButton.Discard)
+    window.close()
+
+
+def test_complete_small_table_shows_actual_total_without_count(qtbot, tmp_path):
+    from dataclasses import replace
+    window = ready_window(qtbot, tmp_path)
+    connection = window.service.save_connection(replace(window.connections[0], id='small', name='Small', is_demo=False))
+    window.connections = window.service.list_connections()
+    window.current_connection = connection
+    window.open_table('customers')
+    qtbot.waitUntil(lambda: not window.busy)
+    window.where_edit.setText('id <= 7')
+    window.apply_table_query()
+    qtbot.waitUntil(lambda: not window.busy)
+    assert window.record_count.text() == 'Showing 1–7 of 7 records'
+    assert not window.next_button.isEnabled()
+    assert not window.count_total_button.isChecked()
     window.close()
