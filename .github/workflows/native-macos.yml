@@ -1,0 +1,34 @@
+name: Native macOS migration checks
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/macos-native]
+  pull_request:
+    paths: ['macos/**', 'baseskiff/native/**', 'BaseSkiffWorker.spec', 'scripts/build_native.py', '.github/workflows/native-macos.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Worker contract tests
+        run: python -m pytest tests/test_native_worker.py -q
+      - name: Swift and AppKit tests
+        run: BASESKIFF_PYTHON="$(command -v python)" BASESKIFF_SOURCE="$PWD" swift test --package-path macos
+      - name: Build standalone native app
+        run: python scripts/build_native.py --smoke-test
+      - name: Verify local signature
+        run: codesign --verify --deep --strict dist/build-*/BaseSkiff.app
+      - name: Archive migration preview
+        run: ditto -c -k --sequesterRsrc --keepParent dist/build-*/BaseSkiff.app dist/BaseSkiff-Native-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BaseSkiff-Native-${{ runner.arch }}
+          path: dist/BaseSkiff-Native-macOS.zip
+          retention-days: 14

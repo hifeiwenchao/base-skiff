@@ -272,3 +272,7 @@ With TLS enabled, MySQL validates system certificate trust and the hostname. Pos
 SQL 表默认先显示数据、按需统计总数；Console 提供缓存补全、格式化、当前语句、多个命名工作区和 SQL 文件；表右键提供统一结构编辑及 SQL 预览。全量 SQL CSV 导出在后台分批运行并支持取消，重启恢复打开的对象与筛选状态。连接可配置查询超时。使用方式与当前限制见 [工作台优化说明](docs/WORKBENCH_OPTIMIZATION.md)。
 
 2026-11-26 补充：Redis 键树增量插入与大集合续载、SQL 作用域补全及按需元数据、复合/排序游标、MySQL 字段属性保留、外键/约束编辑、计划树与 Oracle 计划支持均已接入。详见 [工作台优化](docs/WORKBENCH_OPTIMIZATION.md) 与 [Redis 性能实测](docs/PERFORMANCE_2026_11_26.md)。
+
+## macOS SwiftUI / AppKit 版本
+
+新增独立的 macOS 原生界面，复用现有数据库服务，Windows / Linux 保留现版。开发和本地打包方式见 [原生 macOS 使用说明](docs/NATIVE_MACOS.md)，功能接入与验证边界见 [迁移验收](docs/NATIVE_PARITY.md)。使用 `python scripts/build_native.py --smoke-test` 构建；现有 `scripts/build.py` 继续构建 PySide6 版本。
