@@ -64,14 +64,18 @@ from PySide6.QtWidgets import (
 
 from baseskiff.adapters import MAX_REDIS_KEYS, REDIS_KEY_SEARCH_MODES
 from baseskiff.cancellation import CancellationToken
+from baseskiff.data_transfer import CsvOptions, preview_csv
 from baseskiff.i18n import Translator
 from baseskiff.models import DATABASE_COLORS, ColumnInfo, Connection, QueryResult, RedisKeyPage
 from baseskiff.redis_codec import json_safe, safe_text
 from baseskiff.service import DatabaseService
+from baseskiff.sql_diagnostics import structured_sql_error
 from baseskiff.ui.connection_type import ConnectionTypeDialog
+from baseskiff.ui.data_transfer import CsvImportDialog, CsvOptionsDialog
 from baseskiff.ui.dialogs import ConnectionDialog, RedisKeyDialog, RowDialog
 from baseskiff.ui.editor import QueryEditor, QueryHighlighter
 from baseskiff.ui.icons import icon
+from baseskiff.ui.query_plan import QueryPlanDialog
 from baseskiff.ui.redis_tree import (
     NODE_ID_ROLE,
     NODE_KIND_ROLE,
@@ -628,6 +632,8 @@ class MainWindow(QMainWindow):
         self.edit_row_button.setEnabled(False)
         toolbar_layout.addWidget(self.edit_row_button)
         self.export_button = button('', 'download', self.show_export_menu)
+        self.import_button = button('', 'upload', self.import_table_csv, 'textButton')
+        toolbar_layout.addWidget(self.import_button)
         self.export_button.setMinimumWidth(88)
         toolbar_layout.addWidget(self.export_button)
         self.delete_key_button = button('', 'trash', self.delete_redis_key, 'iconButton')
@@ -668,6 +674,7 @@ class MainWindow(QMainWindow):
         self.data_views.addWidget(self.data_splitter)
         self.redis_view = RedisValueWidget(language=self.language)
         self.redis_view.refresh_requested.connect(self.refresh_data)
+        self.redis_view.load_more_requested.connect(self._load_more_redis_value)
         self.redis_view.mutation_requested.connect(self._mutate_redis_entry)
         self.redis_view.ttl_requested.connect(self._set_redis_ttl)
         self.data_views.addWidget(self.redis_view)
@@ -723,6 +730,7 @@ class MainWindow(QMainWindow):
         self.query_editor.setMinimumHeight(130)
         self.highlighter = QueryHighlighter(self.query_editor.document())
         self.query_editor.textChanged.connect(self._console_text_changed)
+        self.query_editor.metadata_requested.connect(self._request_sql_table_metadata)
         self.query_editor.execute_requested.connect(self.run_query)
         splitter.addWidget(self.query_editor)
         results = QWidget()
@@ -923,7 +931,7 @@ class MainWindow(QMainWindow):
             action = QShortcut(QKeySequence(shortcut), self)
             action.activated.connect(callback)
 
-    def submit(self, function, callback=None, error=None):
+    def submit(self, function, callback=None, error=None, *, error_details=None):
         if self._closed:
             return
         worker = Worker(function)
@@ -942,6 +950,8 @@ class MainWindow(QMainWindow):
                 self._tasks.remove(worker)
             if not self._closed and not self.busy:
                 self.footer_status.setText(self.t('工作空间已就绪', 'Workspace ready'))
+        if error_details is not None:
+            worker.signals.error_details.connect(error_details)
         worker.signals.result.connect(result)
         worker.signals.error.connect(failed)
         worker.signals.finished.connect(finished)
@@ -1681,6 +1691,7 @@ class MainWindow(QMainWindow):
     def _cache_redis_key_page(self, scope, page, text, mode, *, append=False):
         # Merge by the original key, never its shortened or escaped label.
         previous = self._redis_key_pages.get(scope) if append else None
+        new_keys = list(page.keys)
         keys = {table.name: table for table in previous.keys} if previous else {}
         keys.update((table.name, table) for table in page.keys)
         page = RedisKeyPage(list(keys.values()), page.truncated, getattr(page, 'continuation', None))
@@ -1692,8 +1703,54 @@ class MainWindow(QMainWindow):
             self.tables = page.keys
             self._connection_tables[scope[0]] = page.keys
         self._redis_filter_updates[scope] = bool(text)
-        self.rebuild_tree()
+        if not append or not self._append_redis_tree_batch(scope, new_keys):
+            self.rebuild_tree()
         self._sync_redis_search()
+
+    def _append_redis_tree_batch(self, scope, keys):
+        if self._tree_event_depth or self.redis_key_mode.popup_open or self.side_search.text().strip():
+            return False
+        connection = next((c for c in self.connections if c.id == scope[0]), None)
+        if connection is None:
+            return False
+        database = None
+        for index in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(index)
+            if root.data(0, NODE_ID_ROLE) == ('connection', scope[0]):
+                database = next((root.child(i) for i in range(root.childCount())
+                                 if root.child(i).data(0, NODE_ID_ROLE) == ('redis_database', *scope)), None)
+                break
+        if database is None:
+            return False
+        scroll = self.tree.horizontalScrollBar().value(), self.tree.verticalScrollBar().value()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            with QSignalBlocker(self.tree):
+                if database.childCount():
+                    index = database.childCount() - 1
+                    item = database.child(index)
+                    if item.data(0, NODE_KIND_ROLE) in {'redis_load_more', 'redis_placeholder'}:
+                        database.takeChild(index)
+                append_redis_keys(database, replace(connection, database=scope[1]), keys,
+                                  self.t('（空）', '(empty)'), self.t('个已载入的键', 'loaded keys'))
+                for folder in getattr(database, '_redis_new_folders', ()):
+                    folder.setExpanded(self._tree_expansion.get(folder.data(0, NODE_ID_ROLE),
+                        bool(self._redis_applied_searches.get(scope, ('', 'prefix'))[0])))
+                if self._redis_key_pages[scope].continuation is not None:
+                    more = QTreeWidgetItem()
+                    self._configure_redis_load_more(more, scope)
+                    more.setIcon(0, icon('refresh', '#71917a', 14))
+                    more.setData(0, NODE_KIND_ROLE, 'redis_load_more')
+                    more.setData(0, NODE_ID_ROLE, ('redis_load_more', *scope))
+                    more.setData(0, SCOPE_ROLE, scope)
+                    database.addChild(more)
+            self.tree.doItemsLayout()
+            self.tree.horizontalScrollBar().setValue(scroll[0])
+            self.tree.verticalScrollBar().setValue(scroll[1])
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self._redis_filter_updates.pop(scope, None)
+        return True
 
     def _search_redis_keys(self, *_args):
         connection = self.current_connection
@@ -2432,7 +2489,14 @@ class MainWindow(QMainWindow):
         self.submit(partial(self.service.fetch_rows, connection.id, table, **kwargs), loaded,
                     lambda message: self._workspace_error(state, 'rows', request, message))
 
-    def _refresh_redis_value(self, state=None):
+    def _load_more_redis_value(self):
+        state = self._workspace_state()
+        if not state or not state.redis_snapshot or state.loading or state.identity in self._redis_writes:
+            return
+        if state.redis_snapshot.continuation is not None:
+            self._refresh_redis_value(state, append=True)
+
+    def _refresh_redis_value(self, state=None, *, append=False):
         state = state or self._workspace_state()
         if state is None:
             return
@@ -2462,7 +2526,9 @@ class MainWindow(QMainWindow):
                 self.update_context()
                 self.update_pager()
                 self.selection_changed()
-        self.submit(self._connection_operation('read_redis_key', connection, key), loaded,
+        operation = (self._connection_operation('continue_redis_value', connection, state.redis_snapshot) if append
+                     else self._connection_operation('read_redis_key', connection, key))
+        self.submit(operation, loaded,
                     lambda message: self._workspace_error(state, 'rows', request, message))
 
     def _mutate_redis_entry(self, action, payload):
@@ -2696,6 +2762,9 @@ class MainWindow(QMainWindow):
         self.data_views.setCurrentWidget(self.redis_view if redis else self.data_splitter)
         self.data_search.setVisible(not redis)
         sql_table = bool(connection and connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and self.current_table)
+        self.import_button.setVisible(sql_table)
+        self.import_button.setEnabled(bool(sql_table and not connection.read_only))
+        self.import_button.setText(self.t('导入 CSV', 'Import CSV'))
         self.table_criteria_bar.setVisible(sql_table)
         self.where_edit.setVisible(sql_table)
         self.order_by_edit.setVisible(sql_table)
@@ -2955,13 +3024,13 @@ class MainWindow(QMainWindow):
             # exposes that inner tab.
             self.show_workspace()
             self.tabs.setCurrentIndex(1)
-        cursor = self.query_editor.textCursor()
-        query = self.query_editor.current_statement() if current_only or explain else (cursor.selectedText().replace('\u2029', '\n') if cursor.hasSelection() else self.query_editor.toPlainText())
+        query, query_start = self.query_editor.execution_range(current_only=current_only or explain)
         state = self._console_state() if console_active else self._workspace_state()
         if state is None:
             return
         connection = state.connection
         request = state.request('query')
+        self.query_editor.clear_error_location()
         cancel_token = CancellationToken()
         self._query_cancel_token = cancel_token
         state.query_cancel_token = cancel_token
@@ -2986,6 +3055,10 @@ class MainWindow(QMainWindow):
                 self.populate_table(self.query_result_table, result)
                 self.update_context()
                 self.update_query_status()
+                if explain:
+                    plan_dialog = QueryPlanDialog(result, self, self.language)
+                    plan_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+                    plan_dialog.show()
             if changed:
                 self.refresh_catalog(connection, owner=state)
         def failed(message):
@@ -3010,7 +3083,21 @@ class MainWindow(QMainWindow):
             supports_cancel = False
         execute_kwargs = ({'cancel_token': cancel_token}
                           if connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'} and supports_cancel else {})
-        self.submit(self._connection_operation('explain' if explain else 'execute', connection, query, **execute_kwargs), done, failed)
+        editor_source = self.query_editor.toPlainText()
+        selection_offset = len(editor_source[:query_start].encode('utf-16-le')) // 2
+        def diagnostic(error):
+            if (state.accepts('query', request) and (self._console_state() is state or self._workspace_is_active(state))
+                    and self.query_editor.toPlainText() == editor_source):
+                detail = structured_sql_error(error, query)
+                if detail['position'] is not None:
+                    prefix = query[:detail['position'] - 1]
+                    utf16 = selection_offset + len(prefix.encode('utf-16-le')) // 2
+                    absolute = len(editor_source.encode('utf-16-le')[:utf16 * 2].decode('utf-16-le', errors='ignore')) + 1
+                    self.query_editor.show_error_location(position=absolute)
+                elif selection_offset == 0:
+                    self.query_editor.show_error_location(line=detail['line'], column=detail['column'])
+        self.submit(self._connection_operation('explain' if explain else 'execute', connection, query, **execute_kwargs),
+                    done, failed, error_details=diagnostic)
 
     def cancel_query(self):
         state = self._console_state() if self._console_scope is not None else self._workspace_state()
@@ -3619,8 +3706,30 @@ class MainWindow(QMainWindow):
         if not connection:
             return
         tables = self._connection_tables.get(connection.id, [])
+        scope = self._console_scope_for(connection)
+        if getattr(self, '_completion_scope', None) != scope:
+            self._completion_scope = scope
+            self.query_editor.reset_metadata_requests()
         self.query_editor.set_metadata([t.qualified_name for t in tables],
             self._sql_metadata.get(self._console_scope_for(connection), {}))
+
+    def _request_sql_table_metadata(self, table):
+        connection = self.current_connection
+        if not connection or connection.kind not in {'SQLite', 'MySQL', 'PostgreSQL', 'Oracle'}:
+            return
+        available = self._connection_tables.get(connection.id, [])
+        matches = [t.qualified_name for t in available if str(t.qualified_name).casefold() == table.casefold()]
+        if not matches:
+            matches = [t.qualified_name for t in available if str(t.name).casefold() == table.casefold()]
+        if len(matches) != 1:
+            return
+        target = matches[0]
+        scope = self._console_scope_for(connection)
+        def loaded(columns):
+            self._sql_metadata.setdefault(scope, {})[target] = [c.name for c in columns]
+            if self.current_connection and self._console_scope_for(self.current_connection) == scope:
+                self._sync_sql_metadata()
+        self.submit(self._connection_operation('get_schema', connection, target), loaded, self.show_error)
 
     def refresh_sql_metadata(self):
         connection = self.current_connection
@@ -3629,11 +3738,9 @@ class MainWindow(QMainWindow):
         scope = self._console_scope_for(connection)
         def load():
             tables = self._connection_operation('list_tables', connection)()
-            # Warm only a bounded set; typing never queries the server.
-            columns = {}
-            for table in tables[:30]:
-                columns[table.qualified_name] = [c.name for c in self._connection_operation('get_schema', connection, table.qualified_name)()]
-            return tables, columns
+            # Explicit refresh invalidates stale fields; metadata is loaded
+            # on demand instead of retaining obsolete columns after DDL.
+            return tables, {}
         def loaded(result):
             tables, columns = result
             if not any(c.id == connection.id for c in self.connections):
@@ -3641,6 +3748,7 @@ class MainWindow(QMainWindow):
             self._connection_tables[connection.id] = tables
             self._sql_metadata[scope] = columns
             if self.current_connection and self._console_scope_for(self.current_connection) == scope:
+                self.query_editor.reset_metadata_requests()
                 self._sync_sql_metadata()
                 self.footer_detail.setText(self.t(f'提示缓存已更新 · {len(columns)} 张表', f'Completion cache updated · {len(columns)} tables'))
                 self.rebuild_tree()
@@ -3723,10 +3831,11 @@ class MainWindow(QMainWindow):
     def modify_sql_structure(self, connection, table):
         def load():
             return (self._connection_operation('get_schema', connection, table)(),
-                    self._connection_operation('list_indexes', connection, table)())
+                    self._connection_operation('list_indexes', connection, table)(),
+                    self._connection_operation('list_constraints', connection, table)())
         def loaded(metadata):
-            dialog = SqlStructureDialog(connection.kind, table, *metadata, parent=self,
-                                        language=self.language, read_only=connection.read_only)
+            dialog = SqlStructureDialog(connection.kind, table, *metadata[:2], parent=self,
+                                        language=self.language, read_only=connection.read_only, constraints=metadata[2])
             dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
             def apply(statements):
                 def operation():
@@ -3756,26 +3865,32 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addAction(self.t('当前显示数据 CSV…', 'Displayed data CSV…'), lambda: self.export_data(query))
-        menu.addAction(self.t('数据库全部结果 CSV…', 'All database results CSV…'), lambda: self.export_all_data(query))
+        menu.addAction(self.t('数据库全部结果 CSV…', 'All database results CSV…'), lambda: self.export_all_data(query, configure=True))
         source = self.query_export_button if query else self.export_button
         menu.exec(source.mapToGlobal(source.rect().bottomLeft()))
 
     def _update_export_progress(self, dialog, count):
         if dialog in self._export_jobs:
-            dialog.setLabelText(self.t(f'已导出 {count:,} 行…', f'Exported {count:,} rows…'))
+            dialog.setLabelText(self.t(f'已处理 {count:,} 行…', f'Processed {count:,} rows…'))
 
-    def export_all_data(self, query=False):
+    def export_all_data(self, query=False, *, configure=False):
         connection = self.current_connection
         if not connection or connection.kind not in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}:
             return
         options = {}
+        if configure:
+            format_dialog = CsvOptionsDialog(self, self.language, CsvOptions(null_value=''))
+            if format_dialog.exec() != format_dialog.DialogCode.Accepted:
+                return
+            selected = format_dialog.options()
+            options.update(encoding=selected.encoding, null_value=selected.null_value, delimiter=selected.delimiter)
         if query:
             options['query'] = self.query_editor.current_statement()
         else:
             state = self._workspace_state()
             if not state or not state.table:
                 return
-            options = dict(table=state.table, search=state.search, sort_column=state.sort_column,
+            options.update(table=state.table, search=state.search, sort_column=state.sort_column,
                            descending=state.descending, where_clause=state.where_clause, order_by=state.order_by)
         path, _ = QFileDialog.getSaveFileName(self, self.t('导出全部数据库结果', 'Export all database results'), 'export.csv', 'CSV (*.csv)')
         if not path:
@@ -3802,6 +3917,70 @@ class MainWindow(QMainWindow):
         self.submit(self._connection_operation('export_csv', connection, path, **options,
                     cancel_token=token, progress=lambda count: self.export_progress.emit(dialog, count)), done, failed)
         dialog.show()
+
+    def import_table_csv(self):
+        state = self._workspace_state()
+        if (not state or not state.table or state.connection.read_only
+                or state.connection.kind not in {'SQLite', 'MySQL', 'PostgreSQL', 'Oracle'}):
+            return
+        if self._pending_grid_count_for(state):
+            self.show_error(self.t('请先提交或撤销当前网格修改。', 'Commit or revert the grid changes first.'))
+            return
+        source, _ = QFileDialog.getOpenFileName(self, self.t('导入 CSV', 'Import CSV'), '', 'CSV (*.csv);;All files (*)')
+        if not source:
+            return
+        format_dialog = CsvOptionsDialog(self, self.language)
+        if format_dialog.exec() != format_dialog.DialogCode.Accepted:
+            return
+        options = format_dialog.options()
+        connection = state.connection
+        def prepare():
+            before = Path(source).stat()
+            headers, rows = preview_csv(source, options)
+            columns = self._connection_operation('get_schema', connection, state.table)()
+            after = Path(source).stat()
+            fingerprint = (before.st_size, before.st_mtime_ns)
+            if fingerprint != (after.st_size, after.st_mtime_ns):
+                raise ValueError(self.t('CSV 在预览期间已变化，请重新打开。', 'CSV changed during preview; open it again.'))
+            return headers, rows, columns, fingerprint
+        def prepared(preview):
+            if state.closed:
+                return
+            headers, rows, columns, fingerprint = preview
+            mapping_dialog = CsvImportDialog(headers, rows, columns, self, self.language)
+            if mapping_dialog.exec() != mapping_dialog.DialogCode.Accepted:
+                return
+            token = CancellationToken()
+            progress = QProgressDialog(self.t('准备导入…', 'Preparing import…'), self.t('取消', 'Cancel'), 0, 0, self)
+            progress.setWindowTitle(self.t('导入 CSV', 'Import CSV'))
+            progress.setMinimumDuration(0)
+            self._export_jobs[progress] = token
+            def cancel():
+                if not token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None)):
+                    progress.setLabelText(self.t('正在提交，等待确认…', 'Committing; waiting for confirmation…'))
+            progress.canceled.connect(cancel)
+            def finish():
+                self._export_jobs.pop(progress, None)
+                progress.close()
+                progress.deleteLater()
+            def done(result):
+                finish()
+                state.dirty = True
+                if not state.closed and self._workspace_is_active(state):
+                    self.refresh_data()
+                self.footer_detail.setText(self.t(f'已导入 {result.affected:,} 行', f'Imported {result.affected:,} rows'))
+                self.refresh_catalog(connection)
+            def failed(message):
+                finish()
+                if token.cancelled:
+                    self.footer_detail.setText(self.t('导入已取消并回滚', 'Import cancelled and rolled back'))
+                else:
+                    self.show_error(message)
+            self.submit(self._connection_operation('import_csv', connection, source, table=state.table,
+                mapping=mapping_dialog.mapping(), options=options, cancel_token=token, expected_stat=fingerprint,
+                progress=lambda count: self.export_progress.emit(progress, count)), done, failed)
+            progress.show()
+        self.submit(prepare, prepared, self.show_error)
 
     def export_data(self, query=False):
         # QPushButton.clicked passes a bool; the explicit query button uses True.

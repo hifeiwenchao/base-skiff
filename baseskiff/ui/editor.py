@@ -2,9 +2,17 @@ import re
 
 from PySide6.QtCore import QRegularExpression, QStringListModel, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import QCompleter, QPlainTextEdit
+from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit
 
-from baseskiff.sql_editor import KEYWORDS, completion_context, current_statement, format_sql, tokens
+from baseskiff.sql_editor import (
+    KEYWORDS,
+    completion_context,
+    completion_fragment,
+    completion_scope,
+    current_statement_span,
+    format_sql,
+    tokens,
+)
 
 
 class QueryHighlighter(QSyntaxHighlighter):
@@ -40,6 +48,7 @@ class QueryHighlighter(QSyntaxHighlighter):
 
 class QueryEditor(QPlainTextEdit):
     execute_requested = Signal()
+    metadata_requested = Signal(str)
     MAX_COMPLETIONS = 100
     MAX_COMPLETION_TEXT = 100_000
 
@@ -48,6 +57,8 @@ class QueryEditor(QPlainTextEdit):
         self._sql_enabled = True
         self._tables = ()
         self._columns = {}
+        self._metadata_requests = set()
+        self.textChanged.connect(self.clear_error_location)
         self._completion_model = QStringListModel(self)
         self.completer = QCompleter(self._completion_model, self)
         self.completer.setWidget(self)
@@ -60,8 +71,15 @@ class QueryEditor(QPlainTextEdit):
         if not enabled:
             self.completer.popup().hide()
 
+    def reset_metadata_requests(self):
+        """Allow new requests after a connection switch or explicit refresh."""
+        self._metadata_requests.clear()
+
     def set_metadata(self, tables, columns_by_table=None):
-        self._tables = tuple(str(table) for table in tables)
+        new_tables = tuple(str(table) for table in tables)
+        if new_tables != self._tables:
+            self._metadata_requests.clear()
+        self._tables = new_tables
         self._columns = {str(table): tuple(str(column) for column in columns)
                          for table, columns in (columns_by_table or {}).items()}
         self.completer.popup().hide()
@@ -75,31 +93,44 @@ class QueryEditor(QPlainTextEdit):
         match = re.search(r'([\w$]*)(?:\.([\w$]*))?$', code[:position]) if code is not None else None
         return code, match.group(0) if match else ''
 
-    def completion_candidates(self):
-        code, fragment = self._context()
+    def _completion_details(self):
+        code, _ = self._context()
         if code is None:
-            return []
-        prefix = fragment.rsplit('.', 1)[-1]
-        if '.' in fragment:
-            qualifier = fragment.rsplit('.', 1)[0]
-            table = qualifier
-            aliases = re.finditer(r'\b(?:FROM|JOIN|UPDATE|INTO)\s+([\w$]+)(?:\s+(?:AS\s+)?([\w$]+))?', code, re.I)
-            for match in aliases:
-                if match.group(2) and match.group(2).casefold() == qualifier.casefold():
-                    table = match.group(1)
-            choices = next((columns for name, columns in self._columns.items()
-                            if name.casefold() == table.casefold()), ())
+            return [], '', set()
+        text = self.toPlainText()
+        position = len(text.encode('utf-16-le')[:self.textCursor().position() * 2].decode('utf-16-le', errors='ignore'))
+        qualifier, prefix = completion_fragment(text, position)
+        relations, missing, ctes = completion_scope(text, position, self._columns)
+        before = text[:position - len(prefix)]
+        table_context = bool(re.search(r'\b(?:FROM|JOIN|UPDATE|INTO)\s+(?:[\w$]+\.)?$', before, re.I))
+        if qualifier and table_context:
+            choices = [name[len(qualifier) + 1:] for name in self._tables
+                       if name.casefold().startswith(qualifier.casefold() + '.')]
+            missing = set()
+        elif qualifier:
+            choices = relations.get(qualifier.casefold(), ())
+            if not choices:
+                choices = next((values for name, values in self._columns.items()
+                                if name.casefold() == qualifier.casefold()), ()) if not relations else ()
         else:
-            choices = list(KEYWORDS) + list(self._tables)
-            choices += [column for columns in self._columns.values() for column in columns]
-        return sorted({value for value in choices if value.casefold().startswith(prefix.casefold())},
-                      key=str.casefold)[:self.MAX_COMPLETIONS]
+            choices = list(KEYWORDS) + list(self._tables) + list(ctes)
+            choices += [column for values in relations.values() for column in values]
+        values = sorted({value for value in choices if value.casefold().startswith(prefix.casefold())},
+                        key=str.casefold)[:self.MAX_COMPLETIONS]
+        return values, prefix, missing
+
+    def completion_candidates(self):
+        return self._completion_details()[0]
 
     def show_completions(self, automatic=False):
-        code, fragment = self._context()
-        prefix = fragment.rsplit('.', 1)[-1]
-        choices = self.completion_candidates() if code is not None else []
-        if automatic and len(prefix) < 2 and not fragment.endswith('.'):
+        choices, prefix, missing = self._completion_details()
+        if not automatic:
+            for table in sorted(missing - self._metadata_requests):
+                self._metadata_requests.add(table)
+                self.metadata_requested.emit(table)
+        text = self.toPlainText()
+        at_dot = text.encode('utf-16-le')[:self.textCursor().position() * 2].decode('utf-16-le', errors='ignore').endswith('.')
+        if automatic and len(prefix) < 2 and not at_dot:
             choices = []
         if not choices:
             self.completer.popup().hide()
@@ -113,16 +144,37 @@ class QueryEditor(QPlainTextEdit):
         code, fragment = self._context()
         if code is None:
             return
-        prefix = fragment.rsplit('.', 1)[-1]
+        _, prefix, _ = self._completion_details()
         cursor = self.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.KeepAnchor, len(prefix))
+        cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.KeepAnchor, len(prefix.encode('utf-16-le')) // 2)
         cursor.insertText(completion)
         self.setTextCursor(cursor)
         self.completer.popup().hide()
 
-    def current_statement(self):
+    def execution_range(self, current_only=False):
+        """Return execution SQL and its exact Python-character editor offset.
+
+        A selection always takes priority. Selection and whole-document text
+        are returned verbatim; current-statement whitespace is trimmed by the
+        lexer together with its source bounds, so duplicate SQL is unambiguous.
+        """
+        text = self.toPlainText()
         cursor = self.textCursor()
-        return cursor.selectedText().replace('\u2029', '\n') if cursor.hasSelection() else current_statement(self.toPlainText(), len(self.toPlainText().encode('utf-16-le')[:cursor.position() * 2].decode('utf-16-le', errors='ignore')))
+
+        def character_offset(qt_position):
+            return len(text.encode('utf-16-le')[:qt_position * 2].decode('utf-16-le', errors='ignore'))
+
+        if cursor.hasSelection():
+            start = character_offset(cursor.selectionStart())
+            end = character_offset(cursor.selectionEnd())
+            return text[start:end], start
+        if current_only:
+            start, end = current_statement_span(text, character_offset(cursor.position()))
+            return text[start:end], start
+        return text, 0
+
+    def current_statement(self):
+        return self.execution_range(current_only=True)[0]
 
     def format_sql(self):
         if not self._sql_enabled:
@@ -144,9 +196,49 @@ class QueryEditor(QPlainTextEdit):
         cursor.endEditBlock()
         self.setTextCursor(cursor)
 
+    def clear_error_location(self):
+        self.setExtraSelections([])
+
+    def show_error_location(self, position=None, line=None, column=None):
+        """Underline a driver-reported 1-based character position or line/column.
+
+        SQL syntax isn't guessed locally. Missing or invalid locations clear
+        the marker. Character offsets are converted to Qt UTF-16 positions.
+        """
+        self.clear_error_location()
+        text = self.toPlainText()
+        if position is not None:
+            try:
+                offset = int(position) - 1
+            except (ValueError, TypeError):
+                return
+        elif line is not None:
+            try:
+                row, col = int(line), int(column or 1)
+            except (ValueError, TypeError):
+                return
+            lines = text.splitlines(keepends=True)
+            if row < 1 or row > len(lines) or col < 1 or col > len(lines[row - 1].rstrip('\r\n')) + 1:
+                return
+            offset = sum(len(value) for value in lines[:row - 1]) + col - 1
+        else:
+            return
+        if offset < 0 or offset > len(text) or not text:
+            return
+        offset = min(offset, len(text) - 1)
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(len(text[:offset].encode('utf-16-le')) // 2)
+        cursor.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
+        selection.format.setUnderlineColor(QColor('#c45656'))
+        self.setExtraSelections([selection])
+
     def keyPressEvent(self, event):
-        if self.completer.popup().isVisible() and event.key() in (
-                Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Escape, Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+        if (self.completer.popup().isVisible() and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                and event.key() in (
+                Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Escape, Qt.Key.Key_Tab, Qt.Key.Key_Backtab)):
             event.ignore()
             return
         if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)

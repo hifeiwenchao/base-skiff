@@ -25,7 +25,7 @@ def window(qtbot, tmp_path, monkeypatch):
     widget.current_table = ''
     widget.tables = []
     requests = []
-    monkeypatch.setattr(widget, 'submit', lambda function, callback=None, error=None:
+    monkeypatch.setattr(widget, 'submit', lambda function, callback=None, error=None, **kwargs:
                         requests.append((function, callback, error)))
     widget.requests = requests
     widget._redis_database_catalogs[redis.id] = catalog()

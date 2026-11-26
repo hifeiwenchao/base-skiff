@@ -28,6 +28,33 @@ def create_build_directory(root: Path) -> Path:
             return candidate
 
 
+def reserve_build_directories(dist_root: Path, work_root: Path) -> tuple[Path, Path]:
+    """Reserve both paths, including builds sharing only their cache parent."""
+    dist_root.mkdir(parents=True, exist_ok=True)
+    work_root.mkdir(parents=True, exist_ok=True)
+    if dist_root == work_root:
+        raise ValueError('Distribution and work parents must be different directories.')
+    timestamp = datetime.now().replace(microsecond=0)
+    while True:
+        name = timestamp.strftime('build-%Y%m%d%H%M%S')
+        output, cache = dist_root / name, work_root / name
+        try:
+            output.mkdir()
+        except FileExistsError:
+            timestamp += timedelta(seconds=1)
+            continue
+        try:
+            cache.mkdir()
+        except FileExistsError:
+            output.rmdir()
+            timestamp += timedelta(seconds=1)
+        except OSError:
+            output.rmdir()
+            raise
+        else:
+            return output, cache
+
+
 def _failure_summary(path: str | None, title: str, details: str) -> None:
     if not path:
         return
@@ -66,8 +93,7 @@ def main() -> int:
     # startup. Replacing or moving a running bundle can therefore corrupt later
     # driver imports. Keep every build at its own permanent, exclusive path.
     dist_root = args.dist_dir.resolve()
-    dist_dir = create_build_directory(dist_root)
-    work_dir = args.work_dir.resolve() / dist_dir.name
+    dist_dir, work_dir = reserve_build_directories(dist_root, args.work_dir.resolve())
     command = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--distpath", str(dist_dir), "--workpath", str(work_dir),

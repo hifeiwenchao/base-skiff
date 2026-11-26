@@ -155,7 +155,7 @@ GET greeting
 HGETALL customer:1
 ```
 
-不支持订阅、监控等交互命令，以及阻塞命令。查询输出最多显示 **1,000 行**，SQL / MongoDB 的大结果会显示截断状态。Redis 返回值可能包含嵌套集合；侧栏每批最多加载 500 个匹配键，累计展示全部已加载的键。CSV 导出当前显示的结果 / 当前页，完整导出需在服务端或专用工具中完成。
+不支持订阅、监控等交互命令，以及阻塞命令。查询输出最多显示 **1,000 行**，SQL / MongoDB 的大结果会显示截断状态。Redis 返回值可能包含嵌套集合；侧栏每批最多加载 500 个匹配键，累计展示全部已加载的键。CSV 支持导出当前显示的结果 / 当前页；SQL 连接另支持后台分批导出全部结果、编码与 NULL 标记配置，以及预览映射后的事务导入。
 
 Redis 集合超过 1,000 项时，Hash / Set / ZSet 的逐项修改和 List 的编辑 / 追加仍可用；整键替换与 List 删除要求完整载入且不超过 1,000 项。修改会保留服务端绝对过期时间，避免延长 TTL；检测到并发冲突时要求刷新后重试。只读保护与操作历史同样适用于这些操作，直接连接和 SSH 隧道行为一致，界面支持中文 / English 即时切换。
 
@@ -235,7 +235,7 @@ Identically named objects in different connections or databases have separate ta
 
 Drag the divider at the sidebar's right edge to resize it. The default is 240px, with a 200–560px range and at least 640px reserved for the workspace. Narrow windows may limit the available sidebar width. The last dragged width is restored on restart; resizing preserves the open data, query draft and connection state. See the [resized sidebar](docs/sidebar-resize-en.png).
 
-Use SQL in the connection's Console, JSON command objects for MongoDB (for example `{"find":"customers","filter":{}}`), and one shell-style Redis command per run (for example `GET greeting`). Displayed query rows are capped at 1,000; CSV export contains the displayed result or current page. SQL table views provide `WHERE` and `ORDER BY` fragment fields above the grid; click **Apply** or press Enter to execute, and committed conditions are reused for refresh and pagination. Semicolons, comments and multiple statements are rejected. SQL table cells are directly editable except for primary keys. Inserts, edits and deletes stay staged in the tab until **Commit**; **Revert** discards them. A failed commit rolls back the transaction and keeps the staged changes. Tables without a primary key remain read-only, while MongoDB and Redis keep their own editing workflows.
+Use SQL in the connection's Console, JSON command objects for MongoDB (for example `{"find":"customers","filter":{}}`), and one shell-style Redis command per run (for example `GET greeting`). Displayed query rows are capped at 1,000; CSV export supports the displayed result/current page and background full SQL export with encoding/NULL options; SQL tables also support previewed, mapped transactional CSV import. SQL table views provide `WHERE` and `ORDER BY` fragment fields above the grid; click **Apply** or press Enter to execute, and committed conditions are reused for refresh and pagination. Semicolons, comments and multiple statements are rejected. SQL table cells are directly editable except for primary keys. Inserts, edits and deletes stay staged in the tab until **Commit**; **Revert** discards them. A failed commit rolls back the transaction and keeps the staged changes. Tables without a primary key remain read-only, while MongoDB and Redis keep their own editing workflows.
 
 Right-click an SQL table for rename, truncate, add/drop column, drop table, and index management. Dropping a table requires the exact table name followed by a second confirmation. Dropping an index uses a selection from the loaded index list and one confirmation; it never asks the user to type the full index name. Read-only connections hide write operations.
 
@@ -270,3 +270,5 @@ With TLS enabled, MySQL validates system certificate trust and the hostname. Pos
 ### 工作台效率优化
 
 SQL 表默认先显示数据、按需统计总数；Console 提供缓存补全、格式化、当前语句、多个命名工作区和 SQL 文件；表右键提供统一结构编辑及 SQL 预览。全量 SQL CSV 导出在后台分批运行并支持取消，重启恢复打开的对象与筛选状态。连接可配置查询超时。使用方式与当前限制见 [工作台优化说明](docs/WORKBENCH_OPTIMIZATION.md)。
+
+2026-11-26 补充：Redis 键树增量插入与大集合续载、SQL 作用域补全及按需元数据、复合/排序游标、MySQL 字段属性保留、外键/约束编辑、计划树与 Oracle 计划支持均已接入。详见 [工作台优化](docs/WORKBENCH_OPTIMIZATION.md) 与 [Redis 性能实测](docs/PERFORMANCE_2026_11_26.md)。

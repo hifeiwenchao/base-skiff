@@ -211,3 +211,21 @@ def test_timestamp_collision_rolls_over_date(tmp_path, monkeypatch):
     monkeypatch.setattr(build, 'datetime', FrozenDatetime)
     build.create_build_directory(tmp_path)
     assert build.create_build_directory(tmp_path).name == 'build-20270101000000'
+
+
+def test_shared_work_root_reserves_distinct_cache_paths(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 11, 26, 12, 0, 0)
+
+    monkeypatch.setattr(build, 'datetime', FrozenDatetime)
+    work = tmp_path / 'work'
+    first_dist, first_work = build.reserve_build_directories(tmp_path / 'dist1', work)
+    second_dist, second_work = build.reserve_build_directories(tmp_path / 'dist2', work)
+    assert first_work != second_work
+    assert first_dist.name == first_work.name == 'build-20261126120000'
+    assert second_dist.name == second_work.name == 'build-20261126120001'
+    assert not (tmp_path / 'dist2' / first_dist.name).exists()

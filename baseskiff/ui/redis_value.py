@@ -38,6 +38,9 @@ from baseskiff.ui.redis_preview import (
 
 _TEXT = {
     'zh': {
+        'large_list': '列表超过 1,000 项；可追加或编辑，删除需使用查询命令。',
+        'load_more': '加载更多',
+        'loaded_preview': '已载入 {count:,} 项，可继续加载；集合可能在浏览期间变化。',
         'refresh': '刷新', 'copy': '复制', 'edit': '编辑', 'delete': '删除', 'view': '查看',
         'add_hash': '添加字段', 'add_list': '追加元素', 'add_set': '添加成员',
         'add_zset': '添加成员', 'add': '添加', 'save': '保存', 'cancel': '取消',
@@ -70,6 +73,9 @@ _TEXT = {
         'serialized_error': '无法按 {format} 编码：{error}',
     },
     'en': {
+        'large_list': 'Lists over 1,000 items support append and edit; use a query command to delete.',
+        'load_more': 'Load more',
+        'loaded_preview': '{count:,} items loaded; load more to continue. Collections may change while browsing.',
         'refresh': 'Refresh', 'copy': 'Copy', 'edit': 'Edit', 'delete': 'Delete', 'view': 'View',
         'add_hash': 'Add field', 'add_list': 'Append item', 'add_set': 'Add member',
         'add_zset': 'Add member', 'add': 'Add', 'save': 'Save', 'cancel': 'Cancel',
@@ -399,6 +405,7 @@ class RedisValueWidget(QWidget):
 
     mutation_requested = Signal(str, object)
     refresh_requested = Signal()
+    load_more_requested = Signal()
     ttl_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None, language: str = 'zh') -> None:
@@ -496,6 +503,9 @@ class RedisValueWidget(QWidget):
         self.notice_label = _label()
         self.notice_label.setWordWrap(True)
         layout.addWidget(self.notice_label)
+        self.load_more_button = _button('redisValueLoadMore')
+        layout.addWidget(self.load_more_button)
+        self.load_more_button.clicked.connect(self.load_more_requested)
         self.refresh_button.clicked.connect(self.refresh_requested)
         self.copy_button.clicked.connect(self._copy)
         self.view_button.clicked.connect(self._show_selected_preview)
@@ -547,7 +557,21 @@ class RedisValueWidget(QWidget):
         self._submitted_dialog = None
         self._submitted_snapshot = None
         previous_key = self.snapshot.key if self.snapshot is not None else None
+        previous = self.snapshot
+        old_rows = self._rows
         self.snapshot, self.read_only, self._busy = snapshot, read_only, False
+        incoming = self._snapshot_rows(snapshot)
+        append_only = (previous is not None and snapshot is not None
+                       and previous.key == snapshot.key and previous.kind == snapshot.kind
+                       and getattr(previous, 'continuation', None) is not None
+                       and len(incoming) >= len(old_rows)
+                       and incoming[:len(old_rows)] == old_rows)
+        if append_only:
+            self._rows = incoming
+            self._populate_table(start=len(old_rows))
+            self._retranslate()
+            self._apply_filter()
+            return
         self._serialized_cache.clear()
         if previous_key != (snapshot.key if snapshot is not None else None):
             self.entry_search.clear()
@@ -566,22 +590,28 @@ class RedisValueWidget(QWidget):
             self.stack.setCurrentWidget(self.string_page)
         else:
             self.string_editor.clear()
-            data = snapshot.value
-            if self._kind == 'hash':
-                self._rows = list(data.items())
-            elif self._kind == 'list':
-                self._rows = list(enumerate(data))
-            elif self._kind == 'set':
-                self._rows = [(member, member) for member in data]
-            elif self._kind == 'zset':
-                self._rows = list(data.items() if isinstance(data, dict) else data)
-            elif self._kind == 'stream':
-                self._rows = list(data)
-            self._rows = self._rows[:1000]
+            self._rows = incoming
             self._populate_table()
             self.stack.setCurrentWidget(self.table)
         self._retranslate()
         self._apply_filter()
+
+    @staticmethod
+    def _snapshot_rows(snapshot):
+        if snapshot is None:
+            return []
+        data = snapshot.value
+        if snapshot.kind == 'hash':
+            return list(data.items())
+        if snapshot.kind == 'list':
+            return list(enumerate(data))
+        if snapshot.kind == 'set':
+            return [(member, member) for member in data]
+        if snapshot.kind == 'zset':
+            return list(data.items() if isinstance(data, dict) else data)
+        if snapshot.kind == 'stream':
+            return list(data)[:1000]
+        return []
 
     def clear(self) -> None:
         self.set_value(None)
@@ -626,6 +656,7 @@ class RedisValueWidget(QWidget):
                             (self.save_button, 'save_value'), (self.json_button, 'json')):
             button.setText(self._tr(key))
         self.ttl_button.setText(self._tr('set_ttl'))
+        self.load_more_button.setText(self._tr('load_more'))
         self.add_button.setText(self._tr('add_' + self._kind if self._kind in
                                        {'hash', 'list', 'set', 'zset'} else 'add'))
         serialized = self._editable_serialized_string()
@@ -653,7 +684,11 @@ class RedisValueWidget(QWidget):
         self.mode_label.setVisible(self.read_only or self._kind == 'stream')
         truncated = self.snapshot is not None and (self.snapshot.truncated or size > len(self._rows)) and not self._scalar and self._kind not in {'none', 'missing'}
         self.notice_label.setText(self._tr('list_preview' if self._kind == 'list' else 'preview'))
-        self.notice_label.setVisible(truncated)
+        if self.snapshot is not None and getattr(self.snapshot, 'continuation', None) is not None:
+            self.notice_label.setText(self._tr('loaded_preview').format(count=len(self._rows)))
+        if self._kind == 'list' and size > 1000 and not truncated:
+            self.notice_label.setText(self._tr('large_list'))
+        self.notice_label.setVisible(truncated or self._kind == 'list' and size > 1000)
         columns = self._column_labels()
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels(columns)
@@ -706,10 +741,11 @@ class RedisValueWidget(QWidget):
                 'stream': ['stream_id', 'fields']}.get(self._kind, ['value'])
         return [self._tr(key) for key in keys + ([] if self._kind == 'stream' else ['actions'])]
 
-    def _populate_table(self) -> None:
+    def _populate_table(self, start=0) -> None:
         self.table.setColumnCount(len(self._column_labels()))
         self.table.setRowCount(len(self._rows))
-        for row, (entry, raw_value) in enumerate(self._rows):
+        for row in range(start, len(self._rows)):
+            entry, raw_value = self._rows[row]
             cells = [entry] if self._kind == 'set' else [entry, raw_value]
             if self._kind == 'stream':
                 cells[1] = json.dumps(json_safe(raw_value), ensure_ascii=False)
@@ -753,7 +789,7 @@ class RedisValueWidget(QWidget):
                      or self._editable_serialized_string() is not None))
 
     def _can_delete(self) -> bool:
-        return self._can_write() and not (self._kind == 'list' and self.snapshot.truncated)
+        return self._can_write() and not (self._kind == 'list' and (self.snapshot.truncated or self.snapshot.size > 1000))
 
     def _can_edit_row(self, row: int) -> bool:
         return self._can_write() and 0 <= row < len(self._rows) and (
@@ -775,6 +811,8 @@ class RedisValueWidget(QWidget):
         self._update_controls()
 
     def _update_controls(self) -> None:
+        self.load_more_button.setVisible(self.snapshot is not None and getattr(self.snapshot, 'continuation', None) is not None)
+        self.load_more_button.setEnabled(not self._busy)
         mutable = self._can_write()
         collection = self._kind in {'hash', 'list', 'set', 'zset'}
         selected = self.table.currentRow() >= 0 and not self.table.isRowHidden(self.table.currentRow())

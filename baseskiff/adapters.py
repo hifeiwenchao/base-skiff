@@ -32,6 +32,7 @@ from .models import (
     RedisKeyContinuation,
     RedisKeyPage,
     RedisValue,
+    RedisValueContinuation,
     TableInfo,
 )
 
@@ -260,7 +261,14 @@ class SQLAdapter:
                 db.cancel()
             else:
                 # PyMySQL has no portable query-cancel call; closing the
-                # worker's dedicated session interrupts its current command.
+                # socket must first wake its blocking buffered-file read.
+                # close() alone leaves that read alive until read_timeout.
+                stream = getattr(db, '_sock', None)
+                if stream is not None:
+                    try:
+                        stream.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                 db.close()
         except Exception:
             # The worker will surface the original cancellation state. A
@@ -399,9 +407,17 @@ class SQLAdapter:
         return query
 
     def explain(self, query, cancel_token=None):
-        if self.kind == "Oracle":
-            raise ValueError("Oracle execution plans are not supported without writing a plan table.")
         query = self._select_statement(query)
+        if self.kind == "Oracle":
+            if self.connection.read_only:
+                raise PermissionError("Oracle EXPLAIN PLAN writes PLAN_TABLE and is unavailable on read-only connections.")
+            statement_id = "BS_" + uuid.uuid4().hex[:24]
+            with self.session(cancel_token) as db:
+                try:
+                    self._query(db, f"EXPLAIN PLAN SET STATEMENT_ID = '{statement_id}' FOR {query}")
+                    return self._query(db, "SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :1, 'TYPICAL'))", (statement_id,))
+                finally:
+                    self._query(db, "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID=:1", (statement_id,))
         prefix = "EXPLAIN QUERY PLAN " if self.kind == "SQLite" else "EXPLAIN "
         original = self.connection
         try:
@@ -449,8 +465,14 @@ class SQLAdapter:
                 rows = self._query(db, "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, EXISTS (SELECT 1 FROM information_schema.table_constraints t JOIN information_schema.key_column_usage k ON t.constraint_name=k.constraint_name AND t.constraint_schema=k.constraint_schema AND t.table_name=k.table_name WHERE t.constraint_type='PRIMARY KEY' AND t.table_schema=c.table_schema AND t.table_name=c.table_name AND k.column_name=c.column_name) AS pk FROM information_schema.columns c WHERE c.table_schema=%s AND c.table_name=%s ORDER BY c.ordinal_position", (schema, name)).rows
                 return [ColumnInfo(row["column_name"], row["data_type"], bool(row["pk"]), row["is_nullable"] == "YES", row["column_default"]) for row in rows]
             if self.kind == "MySQL":
-                rows = self._query(db, "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, COLUMN_KEY AS key_type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS def FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION", (table,)).rows
-                return [ColumnInfo(row["name"], row["type"], row["key_type"] == "PRI", row["nullable"] == "YES", row["def"]) for row in rows]
+                # Catalog table names are literal identifiers; a dot can be
+                # part of the name just like spaces or embedded backticks.
+                catalog_sql = "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, COLUMN_KEY AS key_type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS def, EXTRA AS extra, CHARACTER_SET_NAME AS charset, COLLATION_NAME AS collation, COLUMN_COMMENT AS comment, GENERATION_EXPRESSION AS generation_expression FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=COALESCE(%s,DATABASE()) AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION"
+                rows = self._query(db, catalog_sql, (self.connection.database or None, table)).rows
+                return [ColumnInfo(row["name"], row["type"], row["key_type"] == "PRI", row["nullable"] == "YES", row["def"],
+                    extra=row.get("extra", ""), charset=row.get("charset"), collation=row.get("collation"), comment=row.get("comment", ""),
+                    generation_expression=row.get("generation_expression", ""), metadata_complete=all(key in row for key in
+                        ("extra", "charset", "collation", "comment", "generation_expression"))) for row in rows]
             name = table.split(".", 1)[-1]
             rows = self._query(db, "SELECT c.column_name, c.data_type, c.nullable, c.data_default, CASE WHEN p.column_name IS NULL THEN 0 ELSE 1 END AS pk FROM user_tab_columns c LEFT JOIN (SELECT k.column_name, k.table_name FROM user_cons_columns k JOIN user_constraints t ON k.constraint_name=t.constraint_name WHERE t.constraint_type='P') p ON p.table_name=c.table_name AND p.column_name=c.column_name WHERE c.table_name=:1 ORDER BY c.column_id", (name,)).rows
             return [ColumnInfo(row["COLUMN_NAME"], row["DATA_TYPE"], bool(row["PK"]), row["NULLABLE"] == "Y", row["DATA_DEFAULT"]) for row in rows]
@@ -525,7 +547,7 @@ class SQLAdapter:
                 return [IndexInfo(name, tuple(column for _, column in sorted(entry["columns"])), entry["unique"],
                                   "pk" if name.upper() == "PRIMARY" else "")
                         for name, entry in sorted(grouped.items())]
-            name = table.split(".", 1)[-1].upper()
+            name = table.split(".", 1)[-1]
             rows = self._query(db, """
                 SELECT i.index_name AS name, i.uniqueness AS uniqueness,
                        (SELECT MAX(CASE WHEN con.constraint_type = 'P' THEN 'pk' ELSE 'u' END)
@@ -569,7 +591,9 @@ class SQLAdapter:
             raise ValueError("Enter a column name.")
         if not isinstance(data_type, str) or not re.match(r"^[A-Za-z][A-Za-z0-9_() ,]*(?: NOT NULL| NULL)?$", data_type.strip(), re.I):
             raise ValueError("Enter a valid column type.")
-        return self._ddl(f"ALTER TABLE {self.table_sql(table)} ADD COLUMN {self.quote(name.strip())} {data_type.strip()}")
+        definition = f"{self.quote(name.strip())} {data_type.strip()}"
+        suffix = f"ADD ({definition})" if self.kind == "Oracle" else f"ADD COLUMN {definition}"
+        return self._ddl(f"ALTER TABLE {self.table_sql(table)} {suffix}")
 
     def drop_column(self, table: str, name: str):
         if not isinstance(name, str) or not name.strip():
@@ -593,9 +617,81 @@ class SQLAdapter:
     def drop_index(self, table: str, name: str):
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Choose an index to delete.")
-        query = (f"DROP INDEX {self.quote(name.strip())} ON {self.table_sql(table)}"
-                 if self.kind == "MySQL" else f"DROP INDEX {self.quote(name.strip())}")
+        index_sql = self.quote(name.strip())
+        if self.kind in {"PostgreSQL", "Oracle"} and "." in table:
+            index_sql = self.quote(table.split('.', 1)[0]) + '.' + index_sql
+        query = (f"DROP INDEX {index_sql} ON {self.table_sql(table)}"
+                 if self.kind == "MySQL" else f"DROP INDEX {index_sql}")
         return self._ddl(query)
+
+    def list_constraints(self, table):
+        from .sql_structure import ConstraintInfo
+        with self.session() as db:
+            if self.kind == 'SQLite':
+                rows = self._query(db, f'PRAGMA foreign_key_list({self.quote(table)})').rows
+                grouped = {}
+                for row in rows:
+                    item = grouped.setdefault(row['id'], ConstraintInfo(f'foreign_key_{row["id"]}', 'FOREIGN KEY', reference_table=row['table'], on_update=row['on_update'], on_delete=row['on_delete']))
+                    item.columns += (row['from'],)
+                    item.reference_columns += (row['to'] or '',)
+                constraints = list(grouped.values())
+                column_rows = self._query(db, f'PRAGMA table_info({self.quote(table)})').rows
+                primary = sorted((row for row in column_rows if row['pk']), key=lambda row:row['pk'])
+                if primary:
+                    constraints.append(ConstraintInfo('PRIMARY KEY', 'PRIMARY KEY', tuple(row['name'] for row in primary)))
+                index_rows = self._query(db, f'PRAGMA index_list({self.quote(table)})').rows
+                for row in index_rows:
+                    if row.get('origin') == 'u':
+                        index_columns = self._query(db, f'PRAGMA index_info({self.quote(row["name"])})').rows
+                        constraints.append(ConstraintInfo(row['name'],'UNIQUE',tuple(item['name'] for item in index_columns)))
+                return constraints
+            if self.kind == 'PostgreSQL':
+                schema, name = table.split('.', 1) if '.' in table else ('public', table)
+                rows = self._query(db, '''SELECT c.conname AS name, c.contype AS kind,
+                    ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(n,p)
+                          JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.n ORDER BY k.p) AS columns,
+                    CASE WHEN c.confrelid=0 THEN '' ELSE c.confrelid::regclass::text END AS reference_table,
+                    ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(n,p)
+                          JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.n ORDER BY k.p) AS reference_columns,
+                    pg_get_constraintdef(c.oid) AS definition
+                    FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+                    JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=%s AND t.relname=%s
+                    ORDER BY c.conname''', (schema,name)).rows
+                kinds = {'p':'PRIMARY KEY','u':'UNIQUE','f':'FOREIGN KEY','c':'CHECK','x':'EXCLUDE'}
+                return [ConstraintInfo(row['name'], kinds.get(row['kind'],row['kind']),tuple(row['columns'] or ()),row['reference_table'],tuple(row['reference_columns'] or ()),row['definition']) for row in rows]
+            if self.kind == 'MySQL':
+                schema, name = self.connection.database, table
+                rows = self._query(db, '''SELECT t.CONSTRAINT_NAME AS name,t.CONSTRAINT_TYPE AS kind,
+                    k.COLUMN_NAME AS column_name,k.REFERENCED_TABLE_SCHEMA AS reference_schema,
+                    k.REFERENCED_TABLE_NAME AS reference_table,k.REFERENCED_COLUMN_NAME AS reference_column,
+                    r.UPDATE_RULE AS on_update,r.DELETE_RULE AS on_delete
+                    FROM information_schema.TABLE_CONSTRAINTS t LEFT JOIN information_schema.KEY_COLUMN_USAGE k
+                    ON k.CONSTRAINT_SCHEMA=t.CONSTRAINT_SCHEMA AND k.TABLE_NAME=t.TABLE_NAME AND k.CONSTRAINT_NAME=t.CONSTRAINT_NAME
+                    LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA=t.CONSTRAINT_SCHEMA
+                    AND r.TABLE_NAME=t.TABLE_NAME AND r.CONSTRAINT_NAME=t.CONSTRAINT_NAME
+                    WHERE t.TABLE_SCHEMA=COALESCE(%s,DATABASE()) AND t.TABLE_NAME=%s ORDER BY t.CONSTRAINT_NAME,k.ORDINAL_POSITION''', (schema or None,name)).rows
+            else:
+                rows = self._query(db, '''SELECT t.CONSTRAINT_NAME AS name,
+                    CASE t.CONSTRAINT_TYPE WHEN 'P' THEN 'PRIMARY KEY' WHEN 'U' THEN 'UNIQUE' WHEN 'R' THEN 'FOREIGN KEY' ELSE 'CHECK' END AS kind,
+                    k.COLUMN_NAME AS column_name,r.OWNER AS reference_schema,r.TABLE_NAME AS reference_table,
+                    rk.COLUMN_NAME AS reference_column,t.DELETE_RULE AS on_delete
+                    FROM user_constraints t LEFT JOIN user_cons_columns k ON k.CONSTRAINT_NAME=t.CONSTRAINT_NAME
+                    LEFT JOIN all_constraints r ON r.OWNER=t.R_OWNER AND r.CONSTRAINT_NAME=t.R_CONSTRAINT_NAME
+                    LEFT JOIN all_cons_columns rk ON rk.OWNER=r.OWNER AND rk.CONSTRAINT_NAME=r.CONSTRAINT_NAME AND rk.POSITION=k.POSITION
+                    WHERE t.TABLE_NAME=:1 ORDER BY t.CONSTRAINT_NAME,k.POSITION''', (table.split('.')[-1],)).rows
+            grouped = {}
+            for raw in rows:
+                row = {key.lower():value for key,value in raw.items()}
+                reference = row.get('reference_table') or ''
+                if reference and row.get('reference_schema'):
+                    reference = row['reference_schema'] + '.' + reference
+                item = grouped.setdefault(row['name'], ConstraintInfo(row['name'],row['kind'],reference_table=reference,
+                    on_update=row.get('on_update') or '',on_delete=row.get('on_delete') or ''))
+                if row.get('column_name'):
+                    item.columns += (row['column_name'],)
+                if row.get('reference_column'):
+                    item.reference_columns += (row['reference_column'],)
+            return list(grouped.values())
 
     def _table_selection(self, table, search="", sort_column="", descending=False,
                          where_clause="", order_by=""):
@@ -626,9 +722,70 @@ class SQLAdapter:
         if custom_where:
             conditions.append(f"({custom_where})")
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        terms = self._cursor_order(columns, sort_column, descending, custom_order, _for_order=True)
         selected = sort_column or next((column.name for column in columns if column.primary_key), names[0] if names else "")
-        order = f" ORDER BY {custom_order}" if custom_order else (f" ORDER BY {self.quote(selected)} {'DESC' if descending else 'ASC'}" if selected else "")
+        order = (" ORDER BY " + ", ".join(f"{self.quote(name)} {'DESC' if desc else 'ASC'}" for name, desc in terms)
+                 if terms else (f" ORDER BY {custom_order}" if custom_order else (f" ORDER BY {self.quote(selected)} {'DESC' if descending else 'ASC'}" if selected else "")))
         return columns, where, order, values
+
+    def _cursor_order(self, columns, sort_column="", descending=False, order_by="", *, _for_order=False):
+        """Only simple catalog identifiers have safe, reproducible cursor semantics."""
+        primary = [c.name for c in columns if c.primary_key]
+        if not primary:
+            return []
+        names = {c.name for c in columns}
+        terms = []
+        if order_by:
+            for part in order_by.split(','):
+                match = re.fullmatch(r'\s*("(?:[^"]|"")+"|`(?:[^`]|``)+`|[A-Za-z_][A-Za-z0-9_$]*)(?:\s+(ASC|DESC))?\s*', part, re.I)
+                if not match:
+                    return []
+                name = match[1]
+                if name[0] in {'"', '`'}:
+                    if name[0] != ('`' if self.kind == 'MySQL' else '"'):
+                        return []
+                    mark = name[0]
+                    name = name[1:-1].replace(mark * 2, mark)
+                if name not in names or name in [n for n, _ in terms]:
+                    return []
+                terms.append((name, (match[2] or 'ASC').upper() == 'DESC'))
+        elif sort_column:
+            terms.append((sort_column, bool(descending)))
+        for name in primary:
+            if name not in [n for n, _ in terms]:
+                terms.append((name, bool(descending) if not terms and not order_by else False))
+        if self.kind == 'MySQL' and not _for_order:
+            ordinal = {column.name for column in columns
+                       if re.match(r'^(?:ENUM|SET)\s*\(', column.data_type.strip(), re.I)}
+            # ORDER BY uses ENUM ordinals / SET bitmasks, while parameterized
+            # comparisons can use string ordering. OFFSET preserves server
+            # semantics until typed ordinal cursor expressions are supported.
+            if any(name in ordinal for name, _ in terms):
+                return []
+        return terms
+
+    def _cursor_condition(self, terms, cursor, values):
+        """Lexicographic predicates matching each backend's native NULL order."""
+        clauses, params = [], list(values)
+        for index, ((name, desc), value) in enumerate(zip(terms, cursor)):
+            prefix = []
+            for (previous, _), old in zip(terms[:index], cursor[:index]):
+                if old is None:
+                    prefix.append(f'{self.quote(previous)} IS NULL')
+                else:
+                    prefix.append(f'{self.quote(previous)} = {self.binds(1, len(params))[0]}')
+                    params.append(old)
+            target = self.quote(name)
+            nulls_first = (not desc) if self.kind in {'SQLite', 'MySQL'} else desc
+            if value is None:
+                comparison = f'{target} IS NOT NULL' if nulls_first else '1=0'
+            else:
+                comparison = f"{target} {'<' if desc else '>'} {self.binds(1, len(params))[0]}"
+                params.append(value)
+                if not nulls_first:
+                    comparison = f'({comparison} OR {target} IS NULL)'
+            clauses.append('(' + ' AND '.join(prefix + [comparison]) + ')')
+        return '(' + ' OR '.join(clauses) + ')', params
 
     def fetch_rows(self, table, page=1, page_size=50, search="", sort_column="", descending=False,
                    where_clause="", order_by="", *, count_total=True, after_key=None, cancel_token=None):
@@ -636,9 +793,18 @@ class SQLAdapter:
             table, search, sort_column, descending, where_clause, order_by)
         page, page_size = max(1, int(page)), max(1, min(MAX_ROWS, int(page_size)))
         primary = [column for column in columns if column.primary_key]
-        # Only the unambiguous default single-key order can use an opaque key.
-        keyset = len(primary) == 1 and not sort_column and not order_by.strip() and not descending
-        cursor_key = primary[0].name if keyset else None
+        terms = self._cursor_order(columns, sort_column, descending, self._custom_fragment(order_by, 'ORDER BY', 'ORDER BY'))
+        keyset = bool(terms)
+        scalar = len(primary) == 1 and not sort_column and not order_by.strip() and not descending
+        signature = tuple(terms)
+        cursor = None
+        if keyset and after_key is not None:
+            if scalar and not isinstance(after_key, dict):
+                cursor = [after_key]
+            elif isinstance(after_key, dict) and after_key.get('order') == signature and len(after_key.get('values', ())) == len(terms):
+                cursor = after_key['values']
+            else:
+                keyset = False  # Incompatible/stale cursors fall back to OFFSET.
         with (self.session(cancel_token) if cancel_token is not None else self.session()) as db:
             count, exact_count = None, bool(count_total)
             if count_total and count_total != "exact" and self.kind == "MySQL" and not where:
@@ -646,7 +812,7 @@ class SQLAdapter:
                     db,
                     "SELECT TABLE_ROWS AS count_rows FROM information_schema.TABLES "
                     "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
-                    (self.connection.database or "", table.split(".")[-1]),
+                    (self.connection.database or "", table),
                 ).rows
                 if estimate and estimate[0].get("count_rows") is not None:
                     count = int(estimate[0]["count_rows"])
@@ -654,10 +820,10 @@ class SQLAdapter:
             if count_total and count is None:
                 total = self._query(db, f"SELECT COUNT(*) AS count_rows FROM {self.table_sql(table)}{where}", values).rows[0]
                 count = int(next(iter(total.values())))
-            use_cursor = keyset and after_key is not None
+            use_cursor = keyset and cursor is not None
             if use_cursor:
-                where += (" AND " if where else " WHERE ") + f"{self.quote(cursor_key)} > {self.binds(1, len(values))[0]}"
-                values = values + [after_key]
+                condition, values = self._cursor_condition(terms, cursor, values)
+                where += (" AND " if where else " WHERE ") + condition
             # Fetch a lookahead row even for estimated totals. Never infer next
             # page availability from a catalog estimate.
             limit = page_size + 1
@@ -683,12 +849,19 @@ class SQLAdapter:
             if not count_total and page == 1 and after_key is None and not result.has_more:
                 result.total = len(result.rows)
                 result.total_known = True
-            result.next_cursor = result.rows[-1][cursor_key] if keyset and result.rows else None
+            if result.rows and any(result.rows[-1][column.name] is None for column in primary):
+                keyset = False  # SQLite permits NULL in legacy composite PRIMARY KEYs.
+            result.next_cursor = (result.rows[-1][primary[0].name] if scalar else
+                {'order': signature, 'values': tuple(result.rows[-1][name] for name, _ in terms)}) if keyset and result.rows else None
             return result
+
+    def import_csv(self, source, **options):
+        from .data_transfer import import_csv
+        return import_csv(self, source, **options)
 
     def export_csv(self, destination, *, table=None, query=None, search="", sort_column="",
                    descending=False, where_clause="", order_by="", cancel_token=None,
-                   progress=None, batch_size=500):
+                   progress=None, batch_size=500, encoding="utf-8-sig", null_value="", delimiter=","):
         """Stream a consistent read-only SQL result to an atomically replaced CSV.
 
         Named PostgreSQL cursors and PyMySQL SSCursor avoid driver-side result
@@ -735,11 +908,11 @@ class SQLAdapter:
                     cursor.execute(query, tuple(values)) if values else cursor.execute(query)
                     if not cursor.description:
                         raise ValueError("The SELECT query did not return rows.")
-                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="",
+                    with tempfile.NamedTemporaryFile(mode="w", encoding=encoding, newline="",
                                                      dir=destination.parent, prefix=f".{destination.name}.",
                                                      suffix=".tmp", delete=False) as stream:
                         temp_path = Path(stream.name)
-                        writer = csv.writer(stream)
+                        writer = csv.writer(stream, delimiter=delimiter)
                         writer.writerow([column[0] for column in cursor.description])
                         while True:
                             if cancel_token is not None:
@@ -751,7 +924,7 @@ class SQLAdapter:
                                 lob_type = module.LOB
                                 batch = [[value.read() if isinstance(value, lob_type) else value
                                           for value in row] for row in batch]
-                            writer.writerows(batch)
+                            writer.writerows([[null_value if value is None else value for value in row] for row in batch])
                             count += len(batch)
                             if progress is not None:
                                 progress(count)
@@ -1242,20 +1415,72 @@ class RedisAdapter:
             return client.dump(key)
         return None
 
-    def read_key(self, key):
+    def _read_collection_page(self, client, key, kind, size, continuation):
+        cursor = continuation.cursor if continuation else 0
+        if kind == "list":
+            value = _redis_decode(client.lrange(key, cursor, cursor + MAX_ROWS - 1))
+            offset = cursor + len(value)
+            next_page = RedisValueContinuation(
+                self.connection.id, str(redis_database_index(self.connection.database or 0)),
+                _redis_bytes(key), kind, offset) if offset < size and value else None
+            return value, next_page
+        selected = []
+        pending = list(continuation.pending) if continuation else []
+        seen = set(continuation.seen) if continuation else set()
+        selected, pending = pending[:MAX_ROWS], pending[MAX_ROWS:]
+        calls = 0
+        while len(selected) < MAX_ROWS and calls < MAX_REDIS_SCAN_CALLS and (
+                cursor != 0 or (continuation is None and calls == 0)):
+            cursor, found = getattr(client, {"hash": "hscan", "set": "sscan", "zset": "zscan"}[kind])(
+                key, cursor=cursor, count=MAX_ROWS)
+            calls += 1
+            entries = list(found.items()) if kind == "hash" else list(found)
+            for entry in entries:
+                identity = _redis_bytes(entry[0] if kind in {"hash", "zset"} else entry)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if len(selected) < MAX_ROWS:
+                    selected.append(entry)
+                else:
+                    pending.append(entry)
+        next_page = RedisValueContinuation(
+            self.connection.id, str(redis_database_index(self.connection.database or 0)),
+            _redis_bytes(key), kind, int(cursor), tuple(pending), frozenset(seen)
+        ) if cursor != 0 or pending else None
+        value = dict(selected) if kind in {"hash", "zset"} else selected
+        return _redis_decode(value), next_page
+
+    def read_key(self, key, *, continuation=None):
+        if continuation is not None and (
+                continuation.connection_id != self.connection.id
+                or continuation.database != str(redis_database_index(self.connection.database or 0))
+                or continuation.key != _redis_bytes(key)):
+            raise ValueError("Redis value continuation belongs to a different connection, database or key.")
         with self.session() as client:
             kind = _redis_kind(client.type(key))
-            value = self._read_value(client, key, kind)
-            if kind == "none":
-                size = 0
-            elif kind == "string":
-                size = client.strlen(key)
-            elif kind in {"hash", "list", "set", "zset", "stream"}:
+            if continuation is not None and kind != continuation.kind:
+                raise ValueError("Redis key type changed or expired; refresh before loading more.")
+            next_page = None
+            if kind in {"hash", "list", "set", "zset"}:
                 size = self._value_size(client, key, kind)
+                value, next_page = self._read_collection_page(client, key, kind, size, continuation)
             else:
-                size = len(_redis_bytes(value)) if isinstance(value, (str, bytes)) else 0
+                value = self._read_value(client, key, kind)
+                if kind == "none":
+                    size = 0
+                elif kind == "string":
+                    size = client.strlen(key)
+                elif kind == "stream":
+                    size = self._value_size(client, key, kind)
+                else:
+                    size = len(_redis_bytes(value)) if isinstance(value, (str, bytes)) else 0
+            # Recheck after reading: never attach a page from a replaced type.
+            if _redis_kind(client.type(key)) != kind:
+                raise ValueError("Redis key type changed or expired; refresh before loading more.")
             return RedisValue(_redis_decode(key), kind, value, size, client.pttl(key),
-                              kind in {"hash", "list", "set", "zset", "stream"} and size > MAX_ROWS)
+                              next_page is not None or kind == "stream" and size > MAX_ROWS,
+                              next_page)
 
     @staticmethod
     def _entry_text(payload, name):
@@ -1673,8 +1898,8 @@ class SSHAdapter:
             return self._run("search_keys", text, mode, limit)
         return self._run("search_keys", text, mode, limit, continuation=continuation)
 
-    def read_key(self, key):
-        return self._run("read_key", key)
+    def read_key(self, key, continuation=None):
+        return self._run("read_key", key, **({"continuation": continuation} if continuation is not None else {}))
 
     def mutate_entry(self, key, kind, action, payload):
         return self._run("mutate_entry", key, kind, action, payload)
@@ -1684,6 +1909,9 @@ class SSHAdapter:
 
     def get_schema(self, table):
         return self._run("get_schema", table)
+
+    def list_constraints(self, table):
+        return self._run("list_constraints", table)
 
     def list_indexes(self, table):
         return self._run("list_indexes", table)
@@ -1721,6 +1949,9 @@ class SSHAdapter:
         if cancel_token is None:
             return self._run("execute", query)
         return self._run("execute", query, cancel_token=cancel_token)
+
+    def import_csv(self, source, **kwargs):
+        return self._run("import_csv", source, **kwargs)
 
     def export_csv(self, destination, **kwargs):
         return self._run("export_csv", destination, **kwargs)

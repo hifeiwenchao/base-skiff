@@ -50,3 +50,24 @@ def test_failed_continuation_restores_retry_row_without_resetting_loaded_tree(wi
     assert len(keys(window)) == 500
     window.tree_clicked(next_row, 0)
     assert len(window.requests) == 1
+
+
+def test_completed_batch_keeps_native_nodes_and_search_widget(window):
+    initial_page(window, page(0, 500, object()))
+    QApplication.processEvents()
+    branch = db_node(window, 0)
+    from baseskiff.ui.redis_tree import NODE_KIND_ROLE, iter_items
+    leaf = next(item for item in iter_items(branch) if item.data(0, NODE_KIND_ROLE) == 'key')
+    search = window._redis_search_item
+    host = window.tree.itemWidget(search, 0)
+    window.tree_clicked(more(window), 0)
+    resets = QSignalSpy(window.tree.model().modelReset)
+    window.requests.pop()[1](page(500, 1000, object()))
+    QApplication.processEvents()
+    assert resets.count() == 0
+    assert isValid(branch) and isValid(leaf)
+    assert db_node(window, 0) is branch
+    assert search is window._redis_search_item
+    assert window.tree.itemWidget(search, 0) is host
+    assert branch.child(0) is search
+    assert len(keys(window)) == 1000

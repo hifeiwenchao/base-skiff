@@ -326,8 +326,23 @@ class DatabaseService:
             return adapter.search_keys(text, mode)
         return adapter.search_keys(text, mode, continuation=continuation)
 
-    def read_redis_key(self, connection_id, key, *, database=None) -> RedisValue:
-        return self._redis_adapter(connection_id, database=database).read_key(key)
+    def read_redis_key(self, connection_id, key, *, database=None, continuation=None) -> RedisValue:
+        adapter = self._redis_adapter(connection_id, database=database)
+        return adapter.read_key(key, continuation=continuation) if continuation is not None else adapter.read_key(key)
+
+    def continue_redis_value(self, connection_id, snapshot, *, database=None) -> RedisValue:
+        """Load one bounded server batch, retaining all entries already displayed."""
+        if snapshot.continuation is None:
+            return snapshot
+        page = self.read_redis_key(connection_id, snapshot.key, database=database,
+                                   continuation=snapshot.continuation)
+        if snapshot.kind in {"hash", "zset"}:
+            value = {**snapshot.value, **page.value}
+        elif snapshot.kind == "set":
+            value = list(dict.fromkeys([*snapshot.value, *page.value]))
+        else:
+            value = [*snapshot.value, *page.value]
+        return replace(page, value=value)
 
     def mutate_redis_entry(self, connection_id, key, kind, action, payload, *, database=None) -> QueryResult:
         description = f"REDIS {action.upper()} {kind} {history_value(key)} {history_value(payload)}"
@@ -355,6 +370,9 @@ class DatabaseService:
     def list_indexes(self, connection_id, table, *, database=None):
         return adapter_for(self._operation_connection(connection_id, database=database)).list_indexes(table)
 
+    def list_constraints(self, connection_id, table, *, database=None):
+        return adapter_for(self._operation_connection(connection_id, database=database)).list_constraints(table)
+
     def rename_table(self, connection_id, table, new_name, *, database=None):
         connection = self._operation_connection(connection_id, database=database)
         query = (f"RENAME TABLE {history_sql_identifier(table, connection.kind, qualified=True)} TO "
@@ -375,8 +393,9 @@ class DatabaseService:
 
     def add_column(self, connection_id, table, name, data_type="TEXT", *, database=None):
         connection = self._operation_connection(connection_id, database=database)
-        query = (f"ALTER TABLE {history_sql_identifier(table, connection.kind, qualified=True)} ADD COLUMN "
-                 f"{history_sql_identifier(name, connection.kind)} {data_type}")
+        definition = f"{history_sql_identifier(name, connection.kind)} {data_type}"
+        suffix = f"ADD ({definition})" if connection.kind == "Oracle" else f"ADD COLUMN {definition}"
+        query = f"ALTER TABLE {history_sql_identifier(table, connection.kind, qualified=True)} {suffix}"
         return self._perform(connection_id, query,
                              lambda adapter: adapter.add_column(table, name, data_type), database=database)
 
@@ -405,6 +424,8 @@ class DatabaseService:
     def drop_index(self, connection_id, table, name, *, database=None):
         connection = self._operation_connection(connection_id, database=database)
         index_sql = history_sql_identifier(name, connection.kind)
+        if connection.kind in {"PostgreSQL", "Oracle"} and "." in table:
+            index_sql = history_sql_identifier(table.split('.', 1)[0], connection.kind) + '.' + index_sql
         table_sql = history_sql_identifier(table, connection.kind, qualified=True)
         query = (f"DROP INDEX {index_sql} ON {table_sql}" if connection.kind == "MySQL"
                  else f"DROP INDEX {index_sql}")
@@ -451,7 +472,7 @@ class DatabaseService:
 
     def export_csv(self, connection_id, destination, *, table=None, query=None, search="",
                    sort_column="", descending=False, where_clause="", order_by="",
-                   database=None, cancel_token=None, progress=None, batch_size=500):
+                   database=None, cancel_token=None, progress=None, batch_size=500, encoding="utf-8-sig", null_value="", delimiter=","):
         connection = self._operation_connection(connection_id, database=database)
         if connection.kind not in {"SQLite", "PostgreSQL", "MySQL", "Oracle"}:
             raise ValueError("Full CSV export currently supports SQL connections.")
@@ -460,7 +481,19 @@ class DatabaseService:
             lambda adapter: adapter.export_csv(
                 destination, table=table, query=query, search=search, sort_column=sort_column,
                 descending=descending, where_clause=where_clause, order_by=order_by,
-                cancel_token=cancel_token, progress=progress, batch_size=batch_size),
+                cancel_token=cancel_token, progress=progress, batch_size=batch_size, encoding=encoding, null_value=null_value, delimiter=delimiter),
+            database=database, cancel_token=cancel_token)
+
+    def import_csv(self, connection_id, source, *, table, mapping, options=None, database=None,
+                   cancel_token=None, progress=None, expected_stat=None):
+        connection = self._operation_connection(connection_id, database=database)
+        if connection.read_only:
+            raise PermissionError("This connection is read-only.")
+        if connection.kind not in {"SQLite", "MySQL", "PostgreSQL", "Oracle"}:
+            raise ValueError("CSV import currently supports SQL tables.")
+        return self._perform(connection_id, f"IMPORT CSV {table}",
+            lambda adapter: adapter.import_csv(source, table=table, mapping=mapping, options=options,
+                cancel_token=cancel_token, progress=progress, expected_stat=expected_stat),
             database=database, cancel_token=cancel_token)
 
     def _perform(self, connection_id, description, operation, *, database=None, cancel_token=None):

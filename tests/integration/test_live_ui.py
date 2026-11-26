@@ -151,6 +151,8 @@ def live_window(qtbot, monkeypatch, live_service, ui_data):
         yield window, errors
     finally:
         _drain(qtbot, window)
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *args: QMessageBox.StandardButton.Discard)
         window.close()
         _drain(qtbot, window)
 
@@ -201,6 +203,9 @@ def _edit_row(window, row_index, changes):
     window.edit_selected_row()
     assert not failures, failures
     assert parsed
+    if window.current_connection.kind in {'SQLite', 'MySQL', 'PostgreSQL', 'Oracle'}:
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
     return parsed[0]
 
 

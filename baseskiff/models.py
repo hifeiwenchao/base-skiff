@@ -71,6 +71,16 @@ class RedisDatabaseList:
     databases: list[RedisDatabaseInfo]
     complete: bool = True
 
+@dataclass(frozen=True)
+class RedisValueContinuation:
+    connection_id: str
+    database: str
+    key: bytes
+    kind: str
+    cursor: int = 0
+    pending: tuple = ()
+    seen: frozenset[bytes] = frozenset()
+
 @dataclass
 class RedisValue:
     key: str | bytes
@@ -79,6 +89,7 @@ class RedisValue:
     size: int = 0
     ttl_ms: int = -1
     truncated: bool = False
+    continuation: RedisValueContinuation | None = None
 
 @dataclass
 class ColumnInfo:
@@ -87,6 +98,12 @@ class ColumnInfo:
     primary_key: bool = False
     nullable: bool = True
     default: Any = None
+    extra: str = ""
+    charset: str | None = None
+    collation: str | None = None
+    comment: str = ""
+    generation_expression: str = ""
+    metadata_complete: bool = False
 
 @dataclass
 class IndexInfo:

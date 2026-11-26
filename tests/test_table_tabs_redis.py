@@ -17,7 +17,7 @@ def redis_tabs(qtbot, tmp_path, monkeypatch):
     qtbot.waitUntil(lambda: not window.busy and window.data_table.rowCount() > 0
                    and QThreadPool.globalInstance().activeThreadCount() == 0, timeout=15000)
     requests = []
-    monkeypatch.setattr(window, 'submit', lambda function, callback=None, error=None:
+    monkeypatch.setattr(window, 'submit', lambda function, callback=None, error=None, **kwargs:
                         requests.append((function, callback, error)))
     connection = Connection('Redis tabs', kind='Redis', database='0')
     window.connections.append(connection)

@@ -2,6 +2,7 @@
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+from shiboken6 import isValid
 
 from baseskiff.redis_codec import safe_text
 from baseskiff.ui.icons import icon
@@ -85,10 +86,52 @@ def iter_items(parent):
         pending.extend(item.child(index) for index in reversed(range(item.childCount())))
 
 
+def _redis_item_order(item):
+    kind = item.data(0, NODE_KIND_ROLE)
+    rank = {'redis_search': -1, 'redis_folder': 0, 'key': 1, 'redis_load_more': 3}.get(kind, 2)
+    label = getattr(item, '_redis_base_label', item.text(0))
+    return rank, label.casefold(), label
+
+
+def _insert_redis_item(parent, item):
+    """Insert a new node without detaching existing rows or their widgets."""
+    order = _redis_item_order(item)
+    low, high = 0, parent.childCount()
+    while low < high:
+        middle = (low + high) // 2
+        if _redis_item_order(parent.child(middle)) <= order:
+            low = middle + 1
+        else:
+            high = middle
+    parent.insertChild(low, item)
+
+
+def reset_redis_keys(root):
+    """Discard references before the owning branch is rebuilt or removed."""
+    root._redis_node_cache = None
+
+
 def append_redis_keys(root, connection, tables, empty_label, count_label):
+    """Append a server batch without rebuilding any already loaded key nodes."""
     separator = connection.redis_separator
-    folders = {}
-    leaves = {}
+    scope = (connection.id, connection.database or '0', separator)
+    cached = getattr(root, '_redis_node_cache', None)
+    if cached is not None:
+        old_scope, folders, leaves = cached
+        # Qt may delete wrappers when a branch is cleared. Validate a sentinel
+        # before touching any cached item, including standalone tree roots.
+        sentinel = next(iter(folders.values()), next(iter(leaves.values()), None))
+        if (old_scope != scope or (sentinel is not None and
+                (not isValid(sentinel) or sentinel.parent() is None))):
+            cached = None
+    if cached is None:
+        folders, leaves = {}, {}
+        root._redis_node_cache = (scope, folders, leaves)
+    affected = {}
+    root._redis_new_folders = []
+    def changed(parent):
+        affected[id(parent)] = parent
+
     for table in tables:
         key = table.name
         if key in leaves:
@@ -116,9 +159,13 @@ def append_redis_keys(root, connection, tables, empty_label, count_label):
                 folder.setData(0, NODE_ID_ROLE, ('redis_folder', connection.id, connection.database or '0', separator, *path))
                 folder.setData(0, SEARCH_ROLE, separator.join(safe_text(part) for part in path) + separator)
                 folder.setData(0, KEY_COUNT_ROLE, 0)
-                parent.addChild(folder)
+                folder._redis_base_label = folder.text(0)
+                _insert_redis_item(parent, folder)
+                changed(parent)
                 folders[path] = folder
+                root._redis_new_folders.append(folder)
             folder.setData(0, KEY_COUNT_ROLE, folder.data(0, KEY_COUNT_ROLE) + 1)
+            changed(folder)
             parent = folder
         shown_key = safe_text(key)
         item = QTreeWidgetItem([shown_key])
@@ -129,15 +176,13 @@ def append_redis_keys(root, connection, tables, empty_label, count_label):
         item.setData(0, NODE_ID_ROLE, ('key', connection.id, connection.database or '0', key))
         item.setData(0, SEARCH_ROLE, shown_key)
         item.setToolTip(0, shown_key)
-        parent.addChild(item)
+        _insert_redis_item(parent, item)
+        changed(parent)
         leaves[key] = item
-    for folder in folders.values():
+    for folder in affected.values():
+        if folder is root or folder.data(0, NODE_KIND_ROLE) != 'redis_folder':
+            continue
         count = folder.data(0, KEY_COUNT_ROLE)
-        folder.setText(0, f'{folder.text(0)} ({count})')
+        folder.setText(0, f'{folder._redis_base_label} ({count})')
         folder.setToolTip(0, f'{folder.data(0, SEARCH_ROLE)}\n{count} {count_label}')
-    for parent in (root, *folders.values()):
-        children = parent.takeChildren()
-        children.sort(key=lambda item: (item.data(0, NODE_KIND_ROLE) != 'redis_folder',
-                                        item.text(0).casefold(), item.text(0)))
-        parent.addChildren(children)
     return leaves

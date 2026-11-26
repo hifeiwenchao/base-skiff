@@ -361,6 +361,8 @@ def test_native_qt_table_tabs_preserve_query_drafts_and_edit_the_original_table(
         window.data_table.selectRow(0)
         QTimer.singleShot(0, accept_edit)
         window.edit_selected_row()
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
         idle(qtbot, window)
         assert not failures, failures
         assert not errors, errors
@@ -388,6 +390,8 @@ def test_native_qt_table_tabs_preserve_query_drafts_and_edit_the_original_table(
 
         QTimer.singleShot(0, accept_add)
         window.add_row()
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
         idle(qtbot, window)
         assert not failures, failures
         assert not errors, errors
@@ -401,6 +405,8 @@ def test_native_qt_table_tabs_preserve_query_drafts_and_edit_the_original_table(
     finally:
         window.search_timer.stop()
         idle(qtbot, window)
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *args: QMessageBox.StandardButton.Discard)
         window.close()
         idle(qtbot, window)
 

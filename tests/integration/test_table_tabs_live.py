@@ -44,7 +44,13 @@ def open_window(qtbot, monkeypatch, service, connection, table):
 def close_window(qtbot, window):
     window.search_timer.stop()
     drain(qtbot, window)
-    window.close()
+    from PySide6.QtWidgets import QMessageBox
+    original_warning = QMessageBox.warning
+    try:
+        QMessageBox.warning = lambda *args: QMessageBox.StandardButton.Discard
+        window.close()
+    finally:
+        QMessageBox.warning = original_warning
     drain(qtbot, window)
 
 
@@ -169,7 +175,7 @@ def test_mysql_edit_finishing_in_background_updates_only_its_table(qtbot, monkey
     drain(qtbot, window)
     activate(qtbot, window, saved.id, saved.database, 'left_records')
     started, release = Event(), Event()
-    original = window.service.update_row
+    original = window.service.apply_grid_changes
 
     def delayed_update(*args, **kwargs):
         started.set()
@@ -177,7 +183,7 @@ def test_mysql_edit_finishing_in_background_updates_only_its_table(qtbot, monkey
             raise RuntimeError('Timed out waiting to complete the table-tab edit')
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(window.service, 'update_row', delayed_update)
+    monkeypatch.setattr(window.service, 'apply_grid_changes', delayed_update)
     failures = []
 
     def accept_edit():
@@ -196,6 +202,8 @@ def test_mysql_edit_finishing_in_background_updates_only_its_table(qtbot, monkey
         QTimer.singleShot(0, accept_edit)
         window.edit_selected_row()
         assert not failures, failures
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
         qtbot.waitUntil(started.is_set, timeout=5000)
         window.table_tabs.setCurrentIndex(tab_index(window, saved.id, saved.database, 'right_records'))
         assert window.current_result.rows == [{'id': 1, 'note': 'right original'}]

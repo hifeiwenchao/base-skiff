@@ -326,6 +326,8 @@ def test_native_table_tabs_retain_drafts_results_and_edit_target(postgres, qtbot
         window.data_table.selectRow(0)
         QTimer.singleShot(0, accept_edit)
         window.edit_selected_row()
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
         drain(qtbot, window)
         assert not dialog_errors, dialog_errors
         assert window.current_result.rows == [{'id': 1, 'name': 'left edited from native dialog', 'amount': Decimal('0')}]
@@ -346,6 +348,8 @@ def test_native_table_tabs_retain_drafts_results_and_edit_target(postgres, qtbot
 
         QTimer.singleShot(0, accept_insert)
         window.add_row()
+        assert window._pending_grid_count() > 0
+        window.commit_table_changes()
         drain(qtbot, window)
         assert not dialog_errors, dialog_errors
         inserted = postgres.service.fetch_rows(postgres.id, left).rows[1]
@@ -361,6 +365,8 @@ def test_native_table_tabs_retain_drafts_results_and_edit_target(postgres, qtbot
     finally:
         window.search_timer.stop()
         drain(qtbot, window)
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *args: QMessageBox.StandardButton.Discard)
         window.close()
         drain(qtbot, window)
 

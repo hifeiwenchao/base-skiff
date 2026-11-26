@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 class WorkerSignals(QObject):
     result = Signal(object)
     error = Signal(str)
+    error_details = Signal(object)
     finished = Signal()
 
 class Worker(QRunnable):
@@ -18,6 +19,7 @@ class Worker(QRunnable):
         try:
             self.signals.result.emit(self.function())
         except Exception as exc:
+            self.signals.error_details.emit(exc)
             self.signals.error.emit(str(exc) or type(exc).__name__)
         finally:
             self.signals.finished.emit()

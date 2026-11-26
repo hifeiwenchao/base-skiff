@@ -48,7 +48,7 @@ class DeferredOperations:
 
             monkeypatch.setattr(window.service, name, defer)
 
-        def submit(function, callback=None, error=None):
+        def submit(function, callback=None, error=None, *, error_details=None):
             operation = function()
             assert isinstance(operation, Operation), 'Unexpected untracked database operation'
             operation.callback, operation.error = callback, error
