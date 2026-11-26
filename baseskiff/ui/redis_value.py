@@ -5,11 +5,12 @@ import json
 import math
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIntValidator
+from PySide6.QtCore import QMimeData, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QIntValidator, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QDialog,
     QFormLayout,
@@ -20,6 +21,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -27,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from baseskiff.redis_codec import encode_preview_value, json_safe, preview_value, safe_text
+from baseskiff.redis_codec import encode_preview_value, json_safe, preview_value, raw_bytes, safe_text
 from baseskiff.ui.icons import icon
 from baseskiff.ui.redis_preview import (
     RedisPreviewDialog,
@@ -71,6 +74,8 @@ _TEXT = {
         'member_preview': '成员预览 · {format} · 只读',
         'serialized_hint': '已识别为 {format}；保存时按原格式编码。',
         'serialized_error': '无法按 {format} 编码：{error}',
+        'draft_preview': '对照预览', 'preview_source': '编辑内容',
+        'formatted_preview': '格式化预览 · 只读', 'copy_key': '复制完整键名',
     },
     'en': {
         'large_list': 'Lists over 1,000 items support append and edit; use a query command to delete.',
@@ -106,6 +111,8 @@ _TEXT = {
         'member_preview': 'Member preview · {format} · read-only',
         'serialized_hint': 'Detected as {format}; saving will preserve the original format.',
         'serialized_error': 'Could not encode as {format}: {error}',
+        'draft_preview': 'Split preview', 'preview_source': 'Edit content',
+        'formatted_preview': 'Formatted preview · read-only', 'copy_key': 'Copy full key',
     },
 }
 
@@ -123,6 +130,117 @@ def _button(name: str, glyph: str | None = None) -> QPushButton:
     if glyph:
         button.setIcon(icon(glyph, '#588068', 16))
     return button
+
+
+class _ElidedKeyLabel(QLabel):
+    """Keep the full accessible key while its painted title fits the workspace."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName('redisKey')
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self.setToolTip(text)
+        self.setAccessibleName(text)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().height())
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.WindowText))
+        painter.drawText(self.contentsRect(), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideMiddle,
+                                                       self.contentsRect().width()))
+
+
+class _DraftPreview(QWidget):
+    """Optional local formatting of a draft; the editable source stays untouched."""
+
+    def __init__(self, source: QPlainTextEdit, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.source = source
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        tools = QHBoxLayout()
+        self.source_label = _label('fieldLabel')
+        tools.addStretch()
+        self.toggle = _button('redisDraftPreviewToggle')
+        self.toggle.setCheckable(True)
+        tools.addWidget(self.toggle)
+        layout.addLayout(tools)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        source_panel = QWidget()
+        source_layout = QVBoxLayout(source_panel)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(6)
+        source_layout.addWidget(self.source_label)
+        source_layout.addWidget(source, 1)
+        self.splitter.addWidget(source_panel)
+        self.preview_panel = QWidget()
+        preview_layout = QVBoxLayout(self.preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+        self.preview_label = _label('fieldLabel')
+        preview_layout.addWidget(self.preview_label)
+        self.editor = QPlainTextEdit()
+        self.editor.setObjectName('redisDraftPreview')
+        self.editor.setReadOnly(True)
+        preview_layout.addWidget(self.editor, 1)
+        self.splitter.addWidget(self.preview_panel)
+        self.preview_panel.hide()
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        layout.addWidget(self.splitter, 1)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(180)
+        self.timer.timeout.connect(self._update_preview)
+        self.toggle.toggled.connect(self._toggle_preview)
+        source.textChanged.connect(self._schedule_preview)
+
+    def set_language(self, language: str) -> None:
+        self.language = language
+        tr = _TEXT[language].__getitem__
+        self.source_label.setText(tr('preview_source'))
+        self.preview_label.setText(tr('formatted_preview'))
+        self.toggle.setText(tr('draft_preview'))
+
+    def _toggle_preview(self, enabled: bool) -> None:
+        self.preview_panel.setVisible(enabled)
+        if enabled:
+            self.splitter.setSizes([self.width() // 2, self.width() // 2])
+            self._update_preview()
+        else:
+            self.timer.stop()
+
+    def _schedule_preview(self) -> None:
+        if self.toggle.isChecked():
+            self.timer.start()
+
+    def _update_preview(self) -> None:
+        # The codec already bounds display size, nesting and parsed item counts.
+        preview = preview_value(self.source.toPlainText())
+        self.editor.setPlainText(preview.text)
+        self.editor.setToolTip(preview_notice(preview.notice, self.language))
+
+    def set_display_preferences(self, font_size: int) -> None:
+        for editor in (self.source, self.editor):
+            font = editor.font()
+            font.setPointSize(font_size)
+            editor.setFont(font)
+            editor.setStyleSheet(f'font-size: {font_size}pt;')
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.splitter.setOrientation(Qt.Orientation.Horizontal if self.width() >= 580
+                                     else Qt.Orientation.Vertical)
 
 
 def _raw(value: Any) -> str:
@@ -294,7 +412,12 @@ class _RedisEntryDialog(QDialog):
         self.value_editor.setReadOnly(self._serialized_preview is None and not is_editable_text(value))
         if kind == 'zset':
             self.value_editor.setMaximumHeight(85)
-        layout.addWidget(self.value_editor, 1)
+        self.draft_preview = _DraftPreview(self.value_editor, self)
+        self.value_preview = self.draft_preview.editor
+        self.preview_toggle = self.draft_preview.toggle
+        self.draft_preview.setVisible(True)
+        self.preview_toggle.setVisible(kind != 'zset')
+        layout.addWidget(self.draft_preview, 1)
         self.hint_label = _label()
         self.hint_label.setWordWrap(True)
         layout.addWidget(self.hint_label)
@@ -317,6 +440,7 @@ class _RedisEntryDialog(QDialog):
 
     def set_language(self, language: str) -> None:
         self.language = language if language in _TEXT else 'en'
+        self.draft_preview.set_language(self.language)
         tr = _TEXT[self.language].__getitem__
         title = tr('edit_title' if self.editing else 'add_title')
         self.setWindowTitle(title)
@@ -414,6 +538,8 @@ class RedisValueWidget(QWidget):
         self.snapshot = None
         self.read_only = False
         self._busy = False
+        self._density = 'compact'
+        self._font_size = 12
         self._rows: list[tuple[Any, Any]] = []
         self._row_buttons: list[tuple[QPushButton, QPushButton]] = []
         # Keep serialized detection out of repeated selection/translation
@@ -428,19 +554,26 @@ class RedisValueWidget(QWidget):
         self._ttl_snapshot = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(13)
-        header = QHBoxLayout()
+        layout.setSpacing(8)
+        self._header_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._header_layout.setSpacing(12)
+        title_group = QWidget()
+        header = QHBoxLayout(title_group)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
         self.type_label = _label('badge')
-        self.key_label = _label('redisKey')
-        self.key_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.key_label.setWordWrap(True)
-        self.key_label.setStyleSheet('font-size: 17px; font-weight: 600; color: #305742;')
+        self.key_label = _ElidedKeyLabel()
+        self.key_label.setStyleSheet('font-weight: 600; color: #305742;')
         header.addWidget(self.type_label)
         header.addWidget(self.key_label, 1)
+        self.key_copy_button = _button('redisCopyKey', 'copy')
+        self.key_copy_button.clicked.connect(self._copy_key)
+        header.addWidget(self.key_copy_button)
         self.refresh_button = _button('redisRefresh', 'refresh')
-        header.addWidget(self.refresh_button)
-        layout.addLayout(header)
-        metadata = QHBoxLayout()
+        self._metadata_group = QWidget()
+        metadata = QHBoxLayout(self._metadata_group)
+        metadata.setContentsMargins(0, 0, 0, 0)
+        metadata.setSpacing(10)
         self.count_label = _label()
         self.ttl_label = _label()
         self.mode_label = _label('statusBadge')
@@ -450,7 +583,10 @@ class RedisValueWidget(QWidget):
         metadata.addWidget(self.ttl_button)
         metadata.addStretch()
         metadata.addWidget(self.mode_label)
-        layout.addLayout(metadata)
+        metadata.addWidget(self.refresh_button)
+        self._header_layout.addWidget(title_group, 1)
+        self._header_layout.addWidget(self._metadata_group)
+        layout.addLayout(self._header_layout)
         toolbar = QHBoxLayout()
         self.add_button = _button('redisAdd', 'plus')
         self.edit_button = _button('redisEdit', 'edit')
@@ -481,14 +617,17 @@ class RedisValueWidget(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(False)
         self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(43)
+        self.table.verticalHeader().setDefaultSectionSize(32)
         self.stack.addWidget(self.table)
         self.string_page = QWidget()
         string_layout = QVBoxLayout(self.string_page)
         string_layout.setContentsMargins(0, 0, 0, 0)
         self.string_editor = QPlainTextEdit()
         self.string_editor.setObjectName('redisStringValue')
-        string_layout.addWidget(self.string_editor, 1)
+        self.draft_preview = _DraftPreview(self.string_editor, self.string_page)
+        self.string_preview = self.draft_preview.editor
+        self.preview_toggle = self.draft_preview.toggle
+        string_layout.addWidget(self.draft_preview, 1)
         string_toolbar = QHBoxLayout()
         self.raw_hint_label = _label()
         self.raw_hint_label.setWordWrap(True)
@@ -519,7 +658,32 @@ class RedisValueWidget(QWidget):
         self.entry_search.textChanged.connect(self._apply_filter)
         self.string_editor.textChanged.connect(self._update_controls)
         self.set_language(language)
+        self.set_display_preferences(self._density, self._font_size)
         self.clear()
+
+    def set_display_preferences(self, density: str, font_size: int) -> None:
+        """Apply workspace density/font choices without reloading Redis data."""
+        self._density = 'comfortable' if density == 'comfortable' else 'compact'
+        self._font_size = max(10, min(20, int(font_size)))
+        height = max(32 if self._density == 'compact' else 43, self._font_size + 18)
+        self.table.verticalHeader().setMinimumSectionSize(height)
+        self.table.verticalHeader().setDefaultSectionSize(height)
+        self.draft_preview.set_display_preferences(self._font_size)
+        if self.entry_dialog is not None:
+            self.entry_dialog.draft_preview.set_display_preferences(self._font_size)
+            font = self.entry_dialog.entry_preview_editor.font()
+            font.setPointSize(self._font_size)
+            self.entry_dialog.entry_preview_editor.setFont(font)
+        self._fit_header()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_header()
+
+    def _fit_header(self) -> None:
+        threshold = max(740, self._metadata_group.sizeHint().width() + 250)
+        self._header_layout.setDirection(QBoxLayout.Direction.LeftToRight if self.width() >= threshold
+                                         else QBoxLayout.Direction.TopToBottom)
 
     def _tr(self, key: str) -> str:
         return _TEXT[self.language][key]
@@ -650,12 +814,16 @@ class RedisValueWidget(QWidget):
         return True
 
     def _retranslate(self) -> None:
+        self.draft_preview.set_language(self.language)
         for button, key in ((self.refresh_button, 'refresh'), (self.copy_button, 'copy'),
                             (self.view_button, 'view'),
                             (self.edit_button, 'edit'), (self.delete_button, 'delete'),
                             (self.save_button, 'save_value'), (self.json_button, 'json')):
             button.setText(self._tr(key))
         self.ttl_button.setText(self._tr('set_ttl'))
+        self.key_copy_button.setToolTip(self._tr('copy_key'))
+        self.key_copy_button.setAccessibleName(self._tr('copy_key'))
+        self.key_copy_button.setEnabled(self.snapshot is not None)
         self.load_more_button.setText(self._tr('load_more'))
         self.add_button.setText(self._tr('add_' + self._kind if self._kind in
                                        {'hash', 'list', 'set', 'zset'} else 'add'))
@@ -672,11 +840,15 @@ class RedisValueWidget(QWidget):
         self.entry_search.setToolTip(self._tr('search_hint'))
         self.entry_search.setVisible(self._kind in {'hash', 'list', 'set', 'zset', 'stream'})
         self.empty_label.setText(self._tr('select' if self.snapshot is None else 'missing'))
-        self.key_label.setText(safe_text(self.snapshot.key) if self.snapshot is not None else '')
+        key = self.snapshot.key if self.snapshot is not None else ''
+        self.key_label.setText(_raw(key))
+        self.key_label.setToolTip(key if isinstance(key, str) else f'<binary: {key.hex(" ")}; {len(key)} bytes>')
         self.type_label.setText(self._kind.upper() if self.snapshot is not None else 'REDIS')
         size = self.snapshot.size if self.snapshot is not None else 0
         unit = 'bytes' if self._scalar else 'entries'
         self.count_label.setText(f'{size:,} {self._tr(unit)}' if self.snapshot is not None else '')
+        if not self._scalar and self._rows and len(self._rows) < size:
+            self.count_label.setText(f'{len(self._rows):,} / {size:,} {self._tr(unit)}')
         ttl = self.snapshot.ttl_ms if self.snapshot is not None else -1
         ttl_text = self._tr('no_expiry') if ttl == -1 else self._tr('expired') if ttl == -2 else f'{self._format_ttl_seconds(ttl)} {self._tr("seconds")}'
         self.ttl_label.setText(f'{self._tr("ttl")}: {ttl_text}' if self.snapshot is not None else '')
@@ -698,6 +870,7 @@ class RedisValueWidget(QWidget):
             delete.setToolTip(self._tr('delete'))
             delete.setAccessibleName(self._tr('delete'))
         self._update_controls()
+        self._fit_header()
 
     @staticmethod
     def _format_ttl_seconds(ttl_ms: int) -> str:
@@ -866,6 +1039,7 @@ class RedisValueWidget(QWidget):
             dialog.entry_edit.hide()
             dialog.entry_label.hide()
         self.entry_dialog = dialog
+        self.set_display_preferences(self._density, self._font_size)
 
         def accepted() -> None:
             if not self._can_write():
@@ -935,6 +1109,15 @@ class RedisValueWidget(QWidget):
             cells = [self.table.item(row, column).text() for column in range(self.table.columnCount())
                      if self.table.item(row, column) is not None]
             QApplication.clipboard().setText('\t'.join(cells))
+
+    def _copy_key(self) -> None:
+        if self.snapshot is None:
+            return
+        key = self.snapshot.key
+        data = QMimeData()
+        data.setData('application/octet-stream', raw_bytes(key))
+        data.setText(key if isinstance(key, str) else f'<binary: {key.hex(" ")}>')
+        QApplication.clipboard().setMimeData(data)
 
     def _show_json(self) -> None:
         if self._scalar:

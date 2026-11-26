@@ -37,11 +37,14 @@ from PySide6.QtWidgets import (
 
 from baseskiff.i18n import Translator
 from baseskiff.models import DEFAULT_PORTS, ColumnInfo, Connection
+from baseskiff.ui.dialog_layout import configure_form, fit_dialog
 
 
 def _label(text: str, name: str = "fieldLabel", parent: QWidget | None = None) -> QLabel:
     widget = QLabel(text, parent)
     widget.setObjectName(name)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setWordWrap(True)
     return widget
 
 
@@ -80,10 +83,7 @@ class ConnectionDialog(QDialog):
         self._result_connection: Connection | None = None
         self.setObjectName("connectionDialog")
         self.setWindowTitle(self.tr("edit_connection" if connection else "new_connection"))
-        self.setMinimumWidth(590)
-        screen = self.screen()
-        available_height = screen.availableGeometry().height() - 60 if screen else 650
-        self.resize(650, min(650, available_height))
+        fit_dialog(self, 650, 650, 540)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 25, 28, 24)
@@ -175,6 +175,7 @@ class ConnectionDialog(QDialog):
         self.database_ssh_hint = _label(self.tr("ssh_database_hint"), "muted")
         self.database_ssh_hint.setWordWrap(True)
         self.form.addRow(self.database_ssh_hint)
+        configure_form(self.form)
         database_scroll.setWidget(database_page)
         self.tabs.addTab(database_scroll, self.tr("database"))
         self._build_ssh_tab()
@@ -297,6 +298,7 @@ class ConnectionDialog(QDialog):
         self.ssh_trust_hint.setWordWrap(True)
         page_layout.addWidget(self.ssh_trust_hint)
         page_layout.addStretch(1)
+        configure_form(self.ssh_form)
         scroll.setWidget(page)
         self.tabs.addTab(scroll, self.tr("ssh_tunnel"))
         self.ssh_enabled_check.toggled.connect(self._update_ssh_fields)
@@ -488,8 +490,7 @@ class RowDialog(QDialog):
         self.null_checks: dict[str, QCheckBox] = {}
         self.setObjectName("rowDialog")
         self.setWindowTitle(self.tr("edit_row" if row is not None else "add_row"))
-        self.setMinimumWidth(540)
-        self.resize(620, min(720, max(340, 200 + len(columns) * 72)))
+        fit_dialog(self, 620, min(720, max(340, 200 + len(columns) * 72)), 480)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 24, 26, 22)
         layout.setSpacing(14)
@@ -551,6 +552,7 @@ class RowDialog(QDialog):
             form.addRow(label, row_widget)
             self.fields[column.name] = field
             self.null_checks[column.name] = null_check
+        configure_form(form)
         scroll.setWidget(container)
         layout.addWidget(scroll, 1)
         self.error_label = _label("", "error")
@@ -712,8 +714,7 @@ class RedisKeyDialog(QDialog):
         self.language = language if language in {'zh', 'en'} else 'en'
         self.setObjectName('redisKeyDialog')
         self.setWindowTitle(self._text('新建 key', 'New key'))
-        self.setMinimumWidth(540)
-        self.resize(620, 560)
+        fit_dialog(self, 620, 560, 480)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 24, 26, 22)
@@ -778,7 +779,13 @@ class RedisKeyDialog(QDialog):
             self._row_containers[kind] = rows
             self.value_stack.addWidget(page)
         form.addRow(_label(self._text('值', 'Value')), self.value_stack)
-        layout.addLayout(form)
+        configure_form(form)
+        form_host = QWidget()
+        form_host.setLayout(form)
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setWidget(form_host)
+        layout.addWidget(form_scroll, 1)
 
         self.error_label = _label('', 'error')
         self.error_label.setWordWrap(True)

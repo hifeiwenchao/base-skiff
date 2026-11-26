@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from baseskiff.data_transfer import CsvOptions
+from baseskiff.ui.dialog_layout import configure_buttons, configure_form, fit_dialog
 from baseskiff.ui.theme import STYLE
 
 
@@ -39,13 +40,16 @@ class CsvOptionsDialog(QDialog):
         form.addRow(self.t('编码', 'Encoding'), self.encoding)
         form.addRow(self.t('分隔符', 'Delimiter'), self.delimiter)
         form.addRow(self.t('NULL 标记', 'NULL marker'), self.null_value)
+        configure_form(form)
         outer.addLayout(form)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.t('确定', 'OK'))
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.t('取消', 'Cancel'))
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        configure_buttons(self.buttons)
         outer.addWidget(self.buttons)
+        fit_dialog(self, 460, 270)
 
     def t(self, zh, en):
         return zh if self.language == 'zh' else en
@@ -60,7 +64,7 @@ class CsvImportDialog(QDialog):
         self.setStyleSheet(STYLE)
         self.language = language
         self.setWindowTitle(self.t('CSV 导入预览与字段映射', 'CSV import preview and column mapping'))
-        self.resize(850, 540)
+        fit_dialog(self, 850, 540)
         outer = QVBoxLayout(self)
         note = QLabel(self.t('首行为标题。下方选择目标字段；确认后在一个事务中导入全部行，失败或取消会回滚。',
                             'The first row is the header. Map target columns below. All rows import in one transaction; errors or cancellation roll back.'))
@@ -89,18 +93,23 @@ class CsvImportDialog(QDialog):
             form.addRow(f'{index + 1}. {title}', combo)
         from PySide6.QtWidgets import QScrollArea, QWidget
         host = QWidget()
+        configure_form(form)
         host.setLayout(form)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(host)
         outer.addWidget(scroll)
         self.error = QLabel()
+        self.error.setObjectName("error")
+        self.error.setWordWrap(True)
+        self.error.hide()
         outer.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.t('导入全部行', 'Import all rows'))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.t('取消', 'Cancel'))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        configure_buttons(buttons)
         row = QHBoxLayout()
         row.addStretch()
         row.addWidget(buttons)
@@ -115,6 +124,7 @@ class CsvImportDialog(QDialog):
     def accept(self):
         mapping = self.mapping()
         if not mapping or len(set(mapping.values())) != len(mapping):
+            self.error.show()
             self.error.setText(self.t('请至少映射一个字段，且目标字段不能重复。', 'Map at least one column, without duplicate targets.'))
             return
         super().accept()

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTreeWidget,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from baseskiff.sql_structure import StructureDraft
+from baseskiff.ui.dialog_layout import configure_form, fit_dialog
 from baseskiff.ui.theme import STYLE
 
 
@@ -56,11 +59,12 @@ class SqlStructureDialog(QDialog):
         self.setObjectName("sqlStructureDialog")
         self.setWindowTitle(self._t("修改表结构", "Modify table structure") + " — " + table)
         self.setStyleSheet(STYLE)
-        self.resize(960, 740)
-        self.setMinimumSize(740, 580)
+        fit_dialog(self, 960, 740, 600)
         outer = QVBoxLayout(self)
         title = QLabel(self.windowTitle())
         title.setObjectName("dialogTitle")
+        title.setWordWrap(True)
+        title.setTextFormat(Qt.TextFormat.PlainText)
         outer.addWidget(title)
         self.notice = QLabel(
             self._t(
@@ -81,18 +85,18 @@ class SqlStructureDialog(QDialog):
         self.tree.setHeaderLabels([self._t("对象 / 类型", "Object / type")])
         self.tree.currentItemChanged.connect(self._selected)
         left_layout.addWidget(self.tree)
-        tools = QHBoxLayout()
+        tools = QGridLayout()
         self.add_column_button = QPushButton(self._t("+ 字段", "+ Column"))
         self.add_index_button = QPushButton(self._t("+ 索引", "+ Index"))
         self.add_constraint_button = QPushButton(self._t("+ 约束", "+ Constraint"))
         self.drop_button = QPushButton(self._t("删除", "Drop"))
-        for button in (
+        for position, button in enumerate((
             self.add_column_button,
             self.add_index_button,
             self.add_constraint_button,
             self.drop_button,
-        ):
-            tools.addWidget(button)
+        )):
+            tools.addWidget(button, position // 2, position % 2)
             button.setAutoDefault(False)
         self.add_column_button.clicked.connect(self._new_column)
         self.add_index_button.clicked.connect(self._new_index)
@@ -131,6 +135,7 @@ class SqlStructureDialog(QDialog):
         form.addRow("", self.nullable_check)
         form.addRow(self._t("默认值类型", "Default kind"), self.default_kind)
         form.addRow(self._t("默认值", "Default value"), self.default_edit)
+        configure_form(form)
         self.properties.addWidget(column_page)
         index_page = QWidget()
         form = QFormLayout(index_page)
@@ -141,6 +146,7 @@ class SqlStructureDialog(QDialog):
         form.addRow(self._t("名称", "Name"), self.index_name_edit)
         form.addRow("", self.unique_check)
         form.addRow(self._t("字段（勾选并拖动排序）", "Columns (check; drag to order)"), self.index_columns)
+        configure_form(form)
         self.properties.addWidget(index_page)
         constraint_page = QWidget()
         constraint_form = QFormLayout(constraint_page)
@@ -169,6 +175,7 @@ class SqlStructureDialog(QDialog):
             (self._t("CHECK 表达式", "CHECK expression"), self.constraint_definition_edit),
         ]:
             constraint_form.addRow(label, widget)
+        configure_form(constraint_form)
         self.properties.addWidget(constraint_page)
         right_layout.addWidget(self.properties)
         self.property_hint = QLabel()
@@ -186,7 +193,10 @@ class SqlStructureDialog(QDialog):
         self.sql_preview.setReadOnly(True)
         self.sql_preview.setMinimumHeight(150)
         body_layout.addWidget(self.sql_preview, 2)
-        outer.addWidget(self.body, 1)
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setWidget(self.body)
+        outer.addWidget(body_scroll, 1)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
         self.error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -195,6 +205,7 @@ class SqlStructureDialog(QDialog):
         self.reset_button = QPushButton(self._t("撤销全部暂存", "Revert draft"))
         self.reset_button.clicked.connect(self._reset)
         self.apply_button = QPushButton(self._t("应用", "Apply"))
+        self.apply_button.setObjectName("primaryButton")
         self.apply_button.clicked.connect(self._apply)
         self.close_button = QPushButton(self._t("关闭", "Close"))
         self.close_button.clicked.connect(self.reject)

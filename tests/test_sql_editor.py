@@ -199,16 +199,20 @@ def test_unclosed_doubled_quotes_and_comments_suppress(qtbot):
 
 
 def test_driver_error_location_unicode_and_edit_clears(qtbot):
+    from PySide6.QtGui import QTextCharFormat
+
     from baseskiff.ui.editor import QueryEditor
     editor = QueryEditor()
     qtbot.addWidget(editor)
     editor.setPlainText("SELECT '😀';\nBAD")
     editor.show_error_location(line=2, column=2)
-    selections = editor.extraSelections()
+    selections = [selection for selection in editor.extraSelections()
+                  if selection.format.underlineStyle() == QTextCharFormat.UnderlineStyle.WaveUnderline]
     assert len(selections) == 1
     assert selections[0].cursor.selectedText() == 'A'
     editor.insertPlainText('x')
-    assert editor.extraSelections() == []
+    assert not any(selection.format.underlineStyle() == QTextCharFormat.UnderlineStyle.WaveUnderline
+                   for selection in editor.extraSelections())
 
 
 def test_cte_body_and_union_keep_aliases_in_their_query_block(qtbot):

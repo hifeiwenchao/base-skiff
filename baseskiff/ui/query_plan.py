@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QTreeWidget, QTreeWidgetItem, QVBoxLayout
 
 from baseskiff.query_plan import normalize_query_plan
+from baseskiff.ui.dialog_layout import configure_buttons, fit_dialog
 from baseskiff.ui.theme import STYLE
 
 
@@ -14,7 +15,7 @@ class QueryPlanDialog(QDialog):
         self.setStyleSheet(STYLE)
         zh = language == 'zh'
         self.setWindowTitle('执行计划' if zh else 'Execution plan')
-        self.resize(950, 600)
+        fit_dialog(self, 950, 600)
         layout = QVBoxLayout(self)
         note = QLabel((f'获取计划耗时 {result.elapsed_ms:.1f} ms。以下为优化器估算，不是实际执行耗时。' if zh else
                        f'Plan retrieved in {result.elapsed_ms:.1f} ms. Values are optimizer estimates, not measured execution timings.'))
@@ -46,4 +47,5 @@ class QueryPlanDialog(QDialog):
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.button(QDialogButtonBox.StandardButton.Close).setText('关闭' if zh else 'Close')
         close.rejected.connect(self.reject)
+        configure_buttons(close)
         layout.addWidget(close)

@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import (
     QEvent,
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QCompleter,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -74,6 +77,7 @@ from baseskiff.ui.connection_type import ConnectionTypeDialog
 from baseskiff.ui.data_transfer import CsvImportDialog, CsvOptionsDialog
 from baseskiff.ui.dialogs import ConnectionDialog, RedisKeyDialog, RowDialog
 from baseskiff.ui.editor import QueryEditor, QueryHighlighter
+from baseskiff.ui.feedback import FeedbackBar
 from baseskiff.ui.icons import icon
 from baseskiff.ui.query_plan import QueryPlanDialog
 from baseskiff.ui.redis_tree import (
@@ -88,6 +92,7 @@ from baseskiff.ui.redis_tree import (
 from baseskiff.ui.redis_value import RedisValueWidget
 from baseskiff.ui.session_state import decode_workspace, encode_workspace
 from baseskiff.ui.sql_structure import SqlStructureDialog
+from baseskiff.ui.task_panel import TaskPanel
 from baseskiff.ui.theme import STYLE
 from baseskiff.ui.workers import Worker
 from baseskiff.ui.workspace_tabs import WorkspaceTab
@@ -216,18 +221,23 @@ class StatusDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         text = index.data() or ''
-        if str(text).lower() not in self.COLORS:
+        if index.data(Qt.ItemDataRole.BackgroundRole) is not None or str(text).lower() not in self.COLORS:
             return super().paint(painter, option, index)
         painter.save()
         painter.fillRect(option.rect, QColor('#edf4e9') if option.state & QStyle.StateFlag.State_Selected else QColor('#ffffff' if index.row() % 2 == 0 else '#fcfdfb'))
         background, foreground = self.COLORS[str(text).lower()]
-        rect = option.rect.adjusted(12, 10, -12, -10)
+        inset = max(3, (option.rect.height() - painter.fontMetrics().height() - 6) // 2)
+        rect = option.rect.adjusted(9, inset, -9, -inset)
         rect.setWidth(min(rect.width(), painter.fontMetrics().horizontalAdvance(text) + 20))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(background))
         painter.drawRoundedRect(rect, 4, 4)
         painter.setPen(QColor(foreground))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        if option.state & QStyle.StateFlag.State_HasFocus:
+            painter.setPen(QColor('#397b60'))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(option.rect.adjusted(0,0,-1,-1))
         painter.restore()
 
 
@@ -238,6 +248,13 @@ class MainWindow(QMainWindow):
         self.service = service or DatabaseService()
         self.settings = QSettings('BaseSkiff', 'BaseSkiff-Smoke' if getattr(service, 'ephemeral', False) else 'BaseSkiff')
         self.language = language or str(self.settings.value('language', 'zh'))
+        density = str(self.settings.value('display_density', 'compact'))
+        self.display_density = density if density in {'compact', 'comfortable'} else 'compact'
+        try:
+            self.display_font_size = max(11, min(16, int(self.settings.value('display_font_size', 12))))
+        except (ValueError, TypeError, OverflowError):
+            self.display_font_size = 12
+        self._has_grid_decorations = False
         self.translator = Translator(self.language)
         self.current_connection: Connection | None = None
         self.current_table = ''
@@ -311,10 +328,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.setStyleSheet(STYLE)
         self._build()
+        self.set_display_preferences(self.display_density, self.display_font_size)
         self._console_save_timer = QTimer(self)
         self._console_save_timer.setSingleShot(True)
         self._console_save_timer.setInterval(350)
         self._console_save_timer.timeout.connect(self._save_console_now)
+        self._task_status_timer = QTimer(self)
+        self._task_status_timer.setInterval(500)
+        self._task_status_timer.timeout.connect(self._update_task_status)
         self.export_progress.connect(self._update_export_progress)
         self._shortcuts()
         self.retranslate()
@@ -463,7 +484,11 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.language_button)
         self.help_button = button('', 'help', self.show_help, 'iconButton')
         top_layout.addWidget(self.help_button)
+        self.display_settings_button = button('', 'settings', self.show_display_menu, 'iconButton')
+        top_layout.addWidget(self.display_settings_button)
         right_layout.addWidget(top)
+        self.feedback_bar = FeedbackBar(language=self.language)
+        right_layout.addWidget(self.feedback_bar)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._workspace_page())
         self.stack.addWidget(self._overview_page())
@@ -482,6 +507,8 @@ class MainWindow(QMainWindow):
         self.footer_detail = label('BaseSkiff 0.1.0', 'muted')
         self.footer_detail.setStyleSheet('font-size: 10px; color: #a4ac9e;')
         footer_layout.addWidget(self.footer_detail)
+        self.tasks_button = button('', 'clock', self.show_tasks, 'textButton')
+        footer_layout.addWidget(self.tasks_button)
         right_layout.addWidget(footer)
         self.shell_splitter.addWidget(right)
         self.shell_splitter.setStretchFactor(0, 0)
@@ -494,6 +521,147 @@ class MainWindow(QMainWindow):
         self.shell_splitter.setSizes([sidebar_width, self.width() - sidebar_width - 6])
         self.shell_splitter.handle(1).setCursor(Qt.CursorShape.SplitHCursor)
         self.shell_splitter.splitterMoved.connect(self._remember_sidebar_width)
+
+    def set_display_preferences(self, density, font_size):
+        self.display_density = density if density in {'compact', 'comfortable'} else 'compact'
+        self.display_font_size = max(11, min(16, int(font_size)))
+        self.settings.setValue('display_density', self.display_density)
+        self.settings.setValue('display_font_size', self.display_font_size)
+        height = max(32 if self.display_density == 'compact' else 43, self.display_font_size * 2 + 6)
+        for table in (self.data_table, self.query_result_table, self.schema_table, self.history_table):
+            table.verticalHeader().setMinimumSectionSize(height)
+            table.verticalHeader().setDefaultSectionSize(height)
+            table.setStyleSheet(f'QTableWidget {{font-size:{self.display_font_size}pt;}} QTableWidget::item {{padding:3px 9px;}}')
+            with QSignalBlocker(table):
+                for row in range(table.rowCount()):
+                    for column in range(table.columnCount()):
+                        item=table.item(row,column)
+                        if item is not None and item.data(Qt.ItemDataRole.FontRole) is not None:
+                            font=item.font()
+                            font.setPointSize(self.display_font_size)
+                            item.setFont(font)
+        self.query_editor.setStyleSheet(f'QPlainTextEdit {{font-size:{self.display_font_size}pt;}}')
+        self.query_editor.set_font_size(self.display_font_size)
+        if hasattr(self.redis_view, 'set_display_preferences'):
+            self.redis_view.set_display_preferences(self.display_density, self.display_font_size)
+        self._update_responsive_layout()
+
+    def show_display_menu(self):
+        menu = QMenu(self)
+        for title, value in [(self.t('紧凑', 'Compact'), 'compact'), (self.t('舒适', 'Comfortable'), 'comfortable')]:
+            action = menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(self.display_density == value)
+            action.triggered.connect(lambda _checked=False,value=value:self.set_display_preferences(value,self.display_font_size))
+        fonts = menu.addMenu(self.t('字号', 'Font size'))
+        for points in range(11,17):
+            action = fonts.addAction(str(points))
+            action.setCheckable(True)
+            action.setChecked(self.display_font_size == points)
+            action.triggered.connect(lambda _checked=False,points=points:self.set_display_preferences(self.display_density,points))
+        menu.exec(self.display_settings_button.mapToGlobal(self.display_settings_button.rect().bottomLeft()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'more_table_button'):
+            self._update_responsive_layout()
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self,'table_toolbar',None) and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0,self._update_responsive_layout)
+        return super().eventFilter(watched,event)
+
+    def _update_responsive_layout(self):
+        if not hasattr(self,'more_table_button'):
+            return
+        available = self.table_toolbar.width()
+        narrow = available < 1050
+        sql = bool(self.current_connection and self.current_connection.kind in {'SQLite','MySQL','PostgreSQL','Oracle'} and self.current_table)
+        redis = bool(self.current_connection and self.current_connection.kind == 'Redis')
+        self.import_button.setVisible(sql and not narrow)
+        self.export_button.setVisible(not narrow)
+        self.edit_row_button.setVisible(not redis and not narrow)
+        self.delete_row_button.setVisible(not redis and not narrow)
+        self.revert_table_button.setVisible(sql and not narrow)
+        self.more_table_button.setVisible(True)
+        self.top_info.setVisible(self.width() >= 1280)
+        self.query_hint.setVisible(self.width() >= 1320)
+        self.query_template_button.setVisible(self.width() >= 1320)
+        for control in (self.run_current_button,self.format_sql_button,self.plan_button):
+            control.setVisible(bool(self.current_connection and self.current_connection.kind in {'SQLite','MySQL','PostgreSQL','Oracle'}))
+
+    def show_table_more_menu(self):
+        menu = QMenu(self)
+        for widget,title in [(self.edit_row_button,self.t('编辑选中记录','Edit selected record')),
+                             (self.delete_row_button,self.t('删除选中记录','Delete selected records')),
+                             (self.import_button,self.t('导入 CSV…','Import CSV…')),
+                             (self.export_button,self.t('导出…','Export…')),
+                             (self.revert_table_button,self.t('撤销修改','Revert changes'))]:
+            if widget is self.import_button and not (self.current_connection and self.current_connection.kind in {'SQLite','MySQL','PostgreSQL','Oracle'}):
+                continue
+            action = menu.addAction(title, widget.click)
+            action.setEnabled(widget.isEnabled())
+        menu.addSeparator()
+        menu.addAction(self.t('显示设置…','Display settings…'),self.show_display_menu)
+        menu.exec(self.more_table_button.mapToGlobal(self.more_table_button.rect().bottomLeft()))
+
+    def pending_change_rows(self):
+        state = self._active_workspace
+        if not state:
+            return []
+        rows = []
+        for record in state.pending_updates.values():
+            for field,value in record['values'].items():
+                rows.append(dict(action=self.t('修改','Update'),key=display_value(record['keys']),field=field,
+                                 old=display_value(record['original'].get(field)),new=display_value(value)))
+        for row in state.pending_inserts:
+            rows.append(dict(action=self.t('新增','Insert'),key='',field='',old='',new=display_value(row)))
+        for row in state.pending_deletes:
+            rows.append(dict(action=self.t('删除','Delete'),key=display_value(row),field='',old=display_value(row),new=''))
+        return rows
+
+    def show_pending_changes(self):
+        rows = self.pending_change_rows()
+        if not rows:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.t('待提交修改','Pending changes'))
+        dialog.resize(850,480)
+        outer = QVBoxLayout(dialog)
+        info = label(self.t('这些修改尚未写入数据库。关闭此窗口会保留修改。','These changes have not been written. Closing this review keeps them staged.'))
+        info.setWordWrap(True)
+        outer.addWidget(info)
+        table = self._make_table()
+        self.populate_table(table,QueryResult(columns=['action','key','field','old','new'],rows=rows[:1000]))
+        table.setHorizontalHeaderLabels([self.t('操作','Action'),self.t('记录','Record'),self.t('字段','Field'),self.t('原值','Original'),self.t('新值','New')])
+        outer.addWidget(table,1)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.button(QDialogButtonBox.StandardButton.Close).setText(self.t('关闭','Close'))
+        close.rejected.connect(dialog.reject)
+        outer.addWidget(close)
+        dialog.exec()
+
+    def _decorate_pending_grid(self):
+        state = self._active_workspace
+        pending = self._pending_grid_count_for(state)
+        if not pending and not self._has_grid_decorations:
+            return
+        self._has_grid_decorations = bool(pending)
+        with QSignalBlocker(self.data_table):
+            for i,row in enumerate(self.current_result.rows):
+                if i >= self.data_table.rowCount():
+                    break
+                key = self._grid_key(row) if state else None
+                update = state.pending_updates.get(key,{}).get('values',{}) if state else {}
+                inserted = bool(state and any(all(row.get(k)==v for k,v in values.items()) for values in state.pending_inserts))
+                header = self.data_table.verticalHeaderItem(i)
+                if header:
+                    header.setText(('+' if inserted else '•') if inserted or update else str((self.page-1)*self.page_size+i+1))
+                    header.setToolTip(self.t('新增待提交','New row pending') if inserted else self.t('修改待提交','Changes pending') if update else '')
+                for j,name in enumerate(self.current_result.columns):
+                    item = self.data_table.item(i,j)
+                    if item is not None:
+                        item.setData(Qt.ItemDataRole.BackgroundRole,QColor('#e9f5ed') if inserted else QColor('#fff3d6') if name in update else None)
 
     def _remember_sidebar_width(self, _position, _index):
         self.settings.setValue('sidebar_width', self.sidebar.width())
@@ -568,7 +736,7 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setWordWrap(False)
-        table.verticalHeader().setDefaultSectionSize(43)
+        table.verticalHeader().setDefaultSectionSize(32 if self.display_density == 'compact' else 43)
         table.verticalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         table.verticalHeader().setMinimumWidth(39)
         table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -610,8 +778,10 @@ class MainWindow(QMainWindow):
         criteria_layout.addWidget(self.clear_table_query_button)
         tab_layout.addWidget(criteria)
         toolbar = QWidget()
+        self.table_toolbar = toolbar
+        toolbar.installEventFilter(self)
         toolbar_layout = layout(toolbar, 0, 8, True)
-        toolbar_layout.setContentsMargins(0, 17, 0, 17)
+        toolbar_layout.setContentsMargins(0, 8, 0, 8)
         self.data_search = QLineEdit(objectName='tableSearch')
         self.data_search.setClearButtonEnabled(True)
         self.data_search.setMaximumWidth(280)
@@ -640,7 +810,8 @@ class MainWindow(QMainWindow):
         self.delete_key_button.hide()
         toolbar_layout.addWidget(self.delete_key_button)
         self.add_row_button = button('', 'plus', self.add_row, 'primaryButton')
-        self.add_row_button.setMinimumWidth(110)
+        self.add_row_button.setMinimumWidth(90)
+        self.add_row_button.setObjectName('secondaryButton')
         toolbar_layout.addWidget(self.add_row_button)
         self.revert_table_button = button('', 'undo', self.revert_table_changes, 'secondaryButton')
         self.revert_table_button.setObjectName('revertTableChanges')
@@ -648,6 +819,10 @@ class MainWindow(QMainWindow):
         self.commit_table_button.setObjectName('commitTableChanges')
         toolbar_layout.addWidget(self.revert_table_button)
         toolbar_layout.addWidget(self.commit_table_button)
+        self.change_summary_button = button('', 'edit', self.show_pending_changes, 'textButton')
+        toolbar_layout.addWidget(self.change_summary_button)
+        self.more_table_button = button('•••', '', self.show_table_more_menu, 'iconButton')
+        toolbar_layout.addWidget(self.more_table_button)
         tab_layout.addWidget(toolbar)
         self.data_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.data_table = self._make_table()
@@ -717,6 +892,11 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.query_template_button)
         self.sql_tools_button = button('SQL', 'settings', self.show_sql_tools, 'textButton')
         tools.addWidget(self.sql_tools_button)
+        self.run_current_button = button('', 'play', lambda:self.run_query(current_only=True), 'textButton')
+        self.format_sql_button = button('', 'code', lambda:self.query_editor.format_sql(), 'textButton')
+        self.plan_button = button('', 'tree', lambda:self.run_query(explain=True), 'textButton')
+        for action in (self.run_current_button,self.format_sql_button,self.plan_button):
+            tools.addWidget(action)
         self.run_button = QueryRunButton()
         self.run_button.setObjectName('primaryButton')
         self.run_button.setIcon(icon('play', '#ffffff', 16))
@@ -935,7 +1115,17 @@ class MainWindow(QMainWindow):
         if self._closed:
             return
         worker = Worker(function)
+        arguments = getattr(function,'args',())
+        connection = next((c for c in self.connections if arguments and c.id == arguments[0]),self.current_connection)
+        operation = getattr(getattr(function,'func',None),'__name__','operation')
+        keywords = getattr(function,'keywords',{}) or {}
+        token = keywords.get('cancel_token')
+        source = connection.name if connection else 'BaseSkiff'
+        worker.presentation = dict(source=source, operation=operation, started=monotonic(),
+            cancel=(lambda:self._cancel_background_operation(token)) if token else None)
         self._tasks.append(worker)
+        if hasattr(self,'_task_status_timer'):
+            self._task_status_timer.start()
         self._pending += 1
         self.footer_status.setText(self.t('正在处理…', 'Working…'))
         def result(value):
@@ -948,6 +1138,9 @@ class MainWindow(QMainWindow):
             self._pending = max(0, self._pending - 1)
             if worker in self._tasks:
                 self._tasks.remove(worker)
+            if not self.busy and hasattr(self,'_task_status_timer'):
+                self._task_status_timer.stop()
+            self._update_task_status()
             if not self._closed and not self.busy:
                 self.footer_status.setText(self.t('工作空间已就绪', 'Workspace ready'))
         if error_details is not None:
@@ -956,6 +1149,44 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(failed)
         worker.signals.finished.connect(finished)
         QThreadPool.globalInstance().start(worker)
+
+    def _cancel_background_operation(self, token):
+        if not token.cancel(lambda callback:self.submit(callback,lambda _:None,lambda _:None)):
+            self.feedback_bar.show_message(self.t('正在提交，等待数据库确认结果。','Committing; waiting for the database result.'))
+            return
+        for state in list(self._workspace_tabs.values())+list(self._console_workspaces.values())+[self._active_workspace]:
+            if state is None or state.query_cancel_token is not token:
+                continue
+            state.request('query')
+            state.query_cancel_token=None
+            state.query_running=False
+            state.query_state='cancelled'
+            state.query_error=''
+            if self._console_state() is state or self._workspace_is_active(state):
+                self._query_cancel_token=None
+                self._query_running=False
+                self._query_state='cancelled'
+                self._query_error=''
+                self.update_context()
+                self.update_query_status()
+            break
+
+    def _update_task_status(self):
+        if self._closed or not hasattr(self,'tasks_button'):
+            return
+        count = len(self._tasks)
+        self.tasks_button.setText(self.t(f'任务 {count}', f'Tasks {count}'))
+        if count:
+            longest = max(monotonic()-worker.presentation['started'] for worker in self._tasks)
+            self.footer_status.setText(self.t(f'{count} 项任务 · {longest:.1f} 秒',f'{count} tasks · {longest:.1f}s'))
+            self.tasks_button.setToolTip('\n'.join(f'{w.presentation["source"]} · {w.presentation["operation"]}' for w in self._tasks[:10]))
+        else:
+            self.tasks_button.setToolTip(self.t('查看后台任务','View background tasks'))
+
+    def show_tasks(self):
+        dialog=TaskPanel(lambda:self._tasks,self,self.language)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
 
     def _open_initial(self):
         if self._restore_session():
@@ -2161,9 +2392,13 @@ class MainWindow(QMainWindow):
                 continue
             connection = state.connection
             table = safe_text(state.table) if connection.kind == 'Redis' else state.table
-            short = table if len(table) <= 32 else table[:29] + '…'
+            short = table if len(table) <= 24 else table[:21] + '…'
             scope = f'{connection.name} · DB{connection.database or "0"}' if connection.kind == 'Redis' else connection.name
-            self.table_tabs.setTabText(index, f'{short} · {scope}')
+            dirty = self._pending_grid_count_for(state) > 0
+            running = state.query_running or state.loading or state.grid_committing
+            shown_scope = scope if len(scope) <= 18 else scope[:15] + '…'
+            self.table_tabs.setTabText(index, ('◌ ' if running else '') + f'{short} · {shown_scope}' + (' ●' if dirty else ''))
+            self.table_tabs.setTabTextColor(index, QColor('#276b50') if dirty else QColor('#465e50'))
             self.table_tabs.setTabToolTip(index, f'{table}\n{scope} · {connection.kind}\n{connection.database or connection.path}')
             self.table_tabs.setTabIcon(index, icon('table', DATABASE_COLORS.get(connection.kind, '#71917a'), 14))
             close_button = self.table_tabs.tabButton(index, QTabBar.ButtonPosition.RightSide)
@@ -2618,7 +2853,7 @@ class MainWindow(QMainWindow):
             table.setHorizontalHeaderLabels(result.columns)
             table.setVerticalHeaderLabels([str(offset + i + 1) for i in range(len(result.rows))])
             mono = QFont('Menlo' if sys.platform == 'darwin' else 'Consolas', 11)
-            mono.setPixelSize(12)
+            mono.setPointSize(self.display_font_size)
             editable_sql = bool(table is self.data_table and self.current_connection
                                 and self.current_connection.kind in {'SQLite', 'PostgreSQL', 'MySQL', 'Oracle'}
                                 and not self.current_connection.read_only
@@ -2818,6 +3053,18 @@ class MainWindow(QMainWindow):
         elif connection and connection.kind == 'Redis':
             self.query_hint.setText(self.t('Redis 命令，例如 GET key 或 SET key value', 'Redis commands, such as GET key or SET key value'))
         self.connection_actions.setEnabled(connection is not None)
+        self.commit_table_button.setText(self.t('提交', 'Commit') + (f' · {pending}' if pending else ''))
+        self.change_summary_button.setText(self.t(f'{pending} 项待提交', f'{pending} pending'))
+        self.change_summary_button.setVisible(bool(sql_table and pending))
+        self.change_summary_button.setToolTip(self.t('查看新增、修改和删除摘要', 'Review inserts, updates and deletions'))
+        self.run_current_button.setText(self.t('当前语句', 'Run current'))
+        self.format_sql_button.setText(self.t('格式化', 'Format'))
+        self.plan_button.setText(self.t('计划', 'Plan'))
+        self.display_settings_button.setToolTip(self.t('显示设置', 'Display settings'))
+        self.more_table_button.setToolTip(self.t('更多表格操作', 'More table actions'))
+        self._decorate_pending_grid()
+        self._update_table_tab_labels()
+        self._update_responsive_layout()
 
     def _pending_grid_count(self):
         state = self._active_workspace
@@ -2939,6 +3186,7 @@ class MainWindow(QMainWindow):
             target.dirty = True
             if self._workspace_is_active(target):
                 self.footer_detail.setText(self.t(f'已提交 · {result.affected} 行', f'Committed · {result.affected} rows'))
+                self.feedback_bar.show_message(self.footer_detail.text())
                 self.refresh_data()
                 self.update_context()
         def failed(message):
@@ -4159,7 +4407,8 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message):
         self.footer_status.setText(self.t('操作失败', 'Operation failed'))
-        QMessageBox.warning(self, self.t('操作未完成', 'Operation could not be completed'), message)
+        self.feedback_bar.language = self.language
+        self.feedback_bar.show_message(message, error=True)
 
     def show_help(self):
         QMessageBox.information(self, 'BaseSkiff', self.t(
@@ -4178,6 +4427,7 @@ class MainWindow(QMainWindow):
             state.close()
         for token in self._export_jobs.values():
             token.cancel(lambda callback: self.submit(callback, lambda _: None, lambda _: None))
+        self._task_status_timer.stop()
         self._closed = True
         self.settings.setValue('language', self.language)
         event.accept()

@@ -1,8 +1,17 @@
 import re
 
-from PySide6.QtCore import QRegularExpression, QStringListModel, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit
+from PySide6.QtCore import QEvent, QRect, QRegularExpression, QSize, QStringListModel, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QPainter,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QTextCursor,
+    QTextFormat,
+)
+from PySide6.QtWidgets import QCompleter, QPlainTextEdit, QTextEdit, QWidget
 
 from baseskiff.sql_editor import (
     KEYWORDS,
@@ -46,6 +55,19 @@ class QueryHighlighter(QSyntaxHighlighter):
 # neither key handling nor popup filtering opens a connection.
 
 
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def sizeHint(self):
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.editor.paint_line_numbers(event)
+
+
 class QueryEditor(QPlainTextEdit):
     execute_requested = Signal()
     metadata_requested = Signal(str)
@@ -54,6 +76,17 @@ class QueryEditor(QPlainTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._error_selection = None
+        self.line_number_area = LineNumberArea(self)
+        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        font.setPointSize(13)
+        self.setFont(font)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.blockCountChanged.connect(self._update_line_number_width)
+        self.updateRequest.connect(self._update_line_number_area)
+        self.cursorPositionChanged.connect(self._update_extra_selections)
+        self._update_line_number_width()
+        self._update_extra_selections()
         self._sql_enabled = True
         self._tables = ()
         self._columns = {}
@@ -65,6 +98,70 @@ class QueryEditor(QPlainTextEdit):
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self.completer.activated[str].connect(self.insert_completion)
+
+    def line_number_area_width(self):
+        digits = len(str(max(1, self.blockCount())))
+        return 20 + self.fontMetrics().horizontalAdvance('9') * digits
+
+    def _update_line_number_width(self, _count=None):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+        self._position_line_number_area()
+
+    def _position_line_number_area(self):
+        rect = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(rect.left(), rect.top(), self.line_number_area_width(), rect.height()))
+
+    def _update_line_number_area(self, rect, dy):
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_line_number_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_line_number_area()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, 'line_number_area'):
+            self._update_line_number_width()
+            self.line_number_area.update()
+
+    def set_font_size(self, points):
+        """Resize the editor and gutter together without replacing its font."""
+        font = self.font()
+        font.setPointSize(max(9, min(24, int(points))))
+        self.setFont(font)
+
+    def paint_line_numbers(self, event):
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor('#f3f4ee'))
+        painter.setFont(self.font())
+        block = self.firstVisibleBlock()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        current_line = self.textCursor().blockNumber()
+        while block.isValid() and top <= event.rect().bottom():
+            height = self.blockBoundingRect(block).height()
+            if block.isVisible() and top + height >= event.rect().top():
+                painter.setPen(QColor('#587361') if block.blockNumber() == current_line else QColor('#9aab9c'))
+                painter.drawText(0, round(top), self.line_number_area.width() - 10, self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight, str(block.blockNumber() + 1))
+            top += height
+            block = block.next()
+
+    def _update_extra_selections(self):
+        current_line = QTextEdit.ExtraSelection()
+        current_line.cursor = self.textCursor()
+        current_line.cursor.clearSelection()
+        current_line.format.setBackground(QColor('#f2f5ee'))
+        current_line.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        selections = [current_line]
+        if self._error_selection is not None:
+            selections.append(self._error_selection)
+        self.setExtraSelections(selections)
+        self.line_number_area.update()
 
     def set_sql_enabled(self, enabled):
         self._sql_enabled = bool(enabled)
@@ -197,7 +294,8 @@ class QueryEditor(QPlainTextEdit):
         self.setTextCursor(cursor)
 
     def clear_error_location(self):
-        self.setExtraSelections([])
+        self._error_selection = None
+        self._update_extra_selections()
 
     def show_error_location(self, position=None, line=None, column=None):
         """Underline a driver-reported 1-based character position or line/column.
@@ -233,7 +331,8 @@ class QueryEditor(QPlainTextEdit):
         selection.cursor = cursor
         selection.format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
         selection.format.setUnderlineColor(QColor('#c45656'))
-        self.setExtraSelections([selection])
+        self._error_selection = selection
+        self._update_extra_selections()
 
     def keyPressEvent(self, event):
         if (self.completer.popup().isVisible() and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
